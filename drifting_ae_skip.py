@@ -538,7 +538,7 @@ def train(dataset_name="spiral", n_components=8, var_weight=0.0, dist_weight=0.0
         y = real_data[idx]
 
         # Sample z from the Gaussian components assigned to y
-        z = prior.sample(batch_size).detach()  # Sample from the entire prior for diversity
+        z = prior.sample(batch_size)  # Sample from the entire prior for diversity
 
         # generate samples
         x = G(z)
@@ -559,19 +559,19 @@ def train(dataset_name="spiral", n_components=8, var_weight=0.0, dist_weight=0.0
         drift_loss = ((x - x_drift) ** 2).sum(dim=1).mean()
         dist_loss = prior.distance_penalty() 
 
-        loss = drift_loss  + id_loss * 0.01 
+        loss = drift_loss + id_loss * 0.01 
 
         opt.zero_grad()
         loss.backward()
         opt.step()
 
-        if step % 200 == 0:
+        if step % 500 == 0:
             print(
                 f"step {step:5d} | "
                 f"drift {drift_loss.item():.6f} | "
             )
 
-        if step % 200 == 0:
+        if step % 1000 == 0:
             plot_samples(G, prior, real_data, step, n=6000, use_pca=use_pca)
 
 
@@ -639,7 +639,7 @@ if __name__ == "__main__":
         n_components=25,
         dist_weight=0.0000001,
         compact_weight=0.03,
-        embed_dim=3,
+        embed_dim=2,
         embed_seed=42
     )
 
