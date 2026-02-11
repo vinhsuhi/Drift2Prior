@@ -557,9 +557,17 @@ def train(dataset_name="spiral", n_components=8, var_weight=0.0, dist_weight=0.0
 
         # losses
         drift_loss = ((x - x_drift) ** 2).sum(dim=1).mean()
-        dist_loss = prior.distance_penalty() 
+        dist_loss = prior.distance_penalty()
 
-        loss = drift_loss + id_loss * 0.01 
+        # Regularization to prevent component collapse
+        # Penalize small determinants (collapsed components)
+        var_penalty = prior.variance_penalty()
+
+        # Encourage positive log determinant (non-collapsed components)
+        # We want to maximize log(det), so we minimize its negative
+        collapse_loss = -var_penalty  # Negative because we want to maximize log det
+
+        loss = drift_loss + id_loss * 0.01 + collapse_loss * 0.0001 / embed_dim
 
         opt.zero_grad()
         loss.backward()
@@ -569,6 +577,9 @@ def train(dataset_name="spiral", n_components=8, var_weight=0.0, dist_weight=0.0
             print(
                 f"step {step:5d} | "
                 f"drift {drift_loss.item():.6f} | "
+                f"id {id_loss.item():.6f} | "
+                f"log_det {var_penalty.item():.4f} | "
+                f"collapse {collapse_loss.item():.6f}"
             )
 
         if step % 1000 == 0:
@@ -637,9 +648,10 @@ if __name__ == "__main__":
         n_arms=5,
         noise=0.05,
         n_components=25,
+        var_weight=0.01,  # Weight for collapse prevention (log det regularization)
         dist_weight=0.0000001,
         compact_weight=0.03,
-        embed_dim=2,
+        embed_dim=100,
         embed_seed=42
     )
 
