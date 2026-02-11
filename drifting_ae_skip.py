@@ -293,9 +293,12 @@ class Generator(nn.Module):
 
         self.skip_weight = nn.Parameter(torch.tensor(1.0))  # Learnable skip connection weight
 
+        self.linear_projection = nn.Linear(z_dim, z_dim)  # Linear projection for skip connection
+
+
     def forward(self, z):
         # Add skip connection to encourage identity mapping
-        return self.net(z) + z * self.skip_weight
+        return self.net(z) + self.linear_projection(z) * self.skip_weight
 
 
 
@@ -347,9 +350,8 @@ def plot_samples(G, prior, real_data, step, n=3000, use_pca=False):
         from sklearn.decomposition import PCA
         pca = PCA(n_components=2)
 
-        # Fit PCA on combined data
-        combined = torch.cat([z.cpu(), x, y], dim=0).numpy()
-        pca.fit(combined)
+        # Fit PCA on real data only (provides more meaningful reference frame)
+        pca.fit(y.numpy())
 
         # Project to 2D
         z_2d = pca.transform(z.cpu().numpy())
@@ -385,7 +387,10 @@ def plot_samples(G, prior, real_data, step, n=3000, use_pca=False):
                 )
             )
 
-    title_suffix = " (PCA projection)" if use_pca and z.shape[1] > 2 else ""
+    # Add dimension info and component count to title
+    dim_info = f"dim={prior.z_dim}, k={prior.k}"
+    title_suffix = f" (PCA from dim {dim_info})" if use_pca and z.shape[1] > 2 else f" ({dim_info})"
+
     axes[0].set_title(f"Latent prior (step {step}){title_suffix}")
     axes[0].axis("equal")
 
@@ -557,9 +562,17 @@ def train(dataset_name="spiral", n_components=8, var_weight=0.0, dist_weight=0.0
 
         # losses
         drift_loss = ((x - x_drift) ** 2).sum(dim=1).mean()
-        dist_loss = prior.distance_penalty() 
+        dist_loss = prior.distance_penalty()
 
-        loss = drift_loss + id_loss * 0.01 
+        # Regularization to prevent component collapse
+        # Penalize small determinants (collapsed components)
+        var_penalty = prior.variance_penalty()
+
+        # Encourage positive log determinant (non-collapsed components)
+        # We want to maximize log(det), so we minimize its negative
+        collapse_loss = -var_penalty  # Negative because we want to maximize log det
+
+        loss = drift_loss + id_loss / embed_dim  + collapse_loss * var_weight / embed_dim
 
         opt.zero_grad()
         loss.backward()
@@ -569,6 +582,9 @@ def train(dataset_name="spiral", n_components=8, var_weight=0.0, dist_weight=0.0
             print(
                 f"step {step:5d} | "
                 f"drift {drift_loss.item():.6f} | "
+                f"id {id_loss.item():.6f} | "
+                f"log_det {var_penalty.item():.4f} | "
+                f"collapse {collapse_loss.item():.6f}"
             )
 
         if step % 1000 == 0:
@@ -637,9 +653,10 @@ if __name__ == "__main__":
         n_arms=5,
         noise=0.05,
         n_components=25,
+        var_weight=0.0001,  # Weight for collapse prevention (log det regularization)
         dist_weight=0.0000001,
         compact_weight=0.03,
-        embed_dim=2,
+        embed_dim=200,
         embed_seed=42
     )
 
