@@ -567,7 +567,7 @@ def train(dataset_name="spiral", n_components=8, var_weight=0.0, dist_weight=0.0
         # We want to maximize log(det), so we minimize its negative
         collapse_loss = -var_penalty  # Negative because we want to maximize log det
 
-        loss = drift_loss + id_loss * 0.01 + collapse_loss * 0.0001 / embed_dim
+        loss = drift_loss + id_loss * 0.01 + collapse_loss * var_weight / embed_dim
 
         opt.zero_grad()
         loss.backward()
@@ -648,7 +648,7 @@ if __name__ == "__main__":
         n_arms=5,
         noise=0.05,
         n_components=25,
-        var_weight=0.01,  # Weight for collapse prevention (log det regularization)
+        var_weight=0.0001,  # Weight for collapse prevention (log det regularization)
         dist_weight=0.0000001,
         compact_weight=0.03,
         embed_dim=100,
