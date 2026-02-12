@@ -65,4 +65,5 @@ For high-dimensional runs, PCA projects both spaces to 2D for plotting.
 ## TODO
 
 - [ ] **Use L2-norm in RBF kernel**: `rbf_kernel` currently uses squared distance (`(diff ** 2).sum(dim=-1)`) in the exponent. Should use the actual L2-norm (`torch.sqrt(dist2)`) for the correct kernel formulation.
+- [ ] **Phase 2 training — conditional sampling via p(y|z)**: Currently (phase 1) `z` and `y` are sampled independently (`z ~ prior`, `y ~ data`). Add a phase 2 that estimates `p(y|z)` (e.g., by assigning each real data point `y` to its nearest GMM component) and then samples paired `(z, y)` from `p(z) * p(y|z)` so the drifting field targets are coherent with the latent samples.
 
