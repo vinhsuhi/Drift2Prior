@@ -6,6 +6,7 @@ import torch.optim as optim
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
 from sklearn.datasets import make_circles
+from sklearn.decomposition import PCA
 
 # ------------------------------------------------------------
 # Device & seed
@@ -119,7 +120,6 @@ class GMMPrior(nn.Module):
         device = data.device
 
         # Compute data statistics
-        data_mean = data.mean(dim=0)
         data_std = data.std(dim=0)
         data_min = data.min(dim=0)[0]
         data_max = data.max(dim=0)[0]
@@ -347,7 +347,6 @@ def plot_samples(G, prior, real_data, step, n=3000, use_pca=False):
 
     # If high-dimensional, use PCA to project to 2D for visualization
     if use_pca and z.shape[1] > 2:
-        from sklearn.decomposition import PCA
         pca = PCA(n_components=2)
 
         # Fit PCA on real data only (provides more meaningful reference frame)
@@ -487,8 +486,8 @@ def get_dataset(dataset_name="spiral", n_samples=10000, **kwargs):
 # ------------------------------------------------------------
 # Training
 # ------------------------------------------------------------
-def train(dataset_name="spiral", n_components=8, var_weight=0.0, dist_weight=0.0,
-          id_weight=1.0, compact_weight=0.0, embed_dim=None, embed_seed=42, **dataset_kwargs):
+def train(dataset_name="spiral", n_components=8, var_weight=0.0,
+          embed_dim=None, embed_seed=42, **dataset_kwargs):
     """
     Train the generator using drifting field with learnable GMM prior.
 
@@ -496,9 +495,6 @@ def train(dataset_name="spiral", n_components=8, var_weight=0.0, dist_weight=0.0
         dataset_name: name of dataset to use (spiral, checkerboard, pinwheel, rings, swissroll)
         n_components: number of Gaussian components in the mixture
         var_weight: weight for variance penalty (log-determinant)
-        dist_weight: weight for distance penalty (to prevent components from collapsing)
-        id_weight: weight for identity loss (to encourage G to be close to identity)
-        compact_weight: weight for compactness penalty (to keep clusters small/tight)
         embed_dim: if specified, embed 2D data into this dimension via random rotation
         embed_seed: random seed for the embedding rotation
         **dataset_kwargs: additional arguments for dataset generation
@@ -533,8 +529,6 @@ def train(dataset_name="spiral", n_components=8, var_weight=0.0, dist_weight=0.0
     steps = 200000
     sigma = 0.1
 
-    
-
     # phase 3: train the generator with drifting field
     # Now sample z from components corresponding to y
     for step in range(steps):
@@ -562,7 +556,6 @@ def train(dataset_name="spiral", n_components=8, var_weight=0.0, dist_weight=0.0
 
         # losses
         drift_loss = ((x - x_drift) ** 2).sum(dim=1).mean()
-        dist_loss = prior.distance_penalty()
 
         # Regularization to prevent component collapse
         # Penalize small determinants (collapsed components)
@@ -609,8 +602,6 @@ if __name__ == "__main__":
     #     n_arms=2,
     #     noise=0.001,
     #     n_components=40,
-    #     dist_weight=0.0000001,
-    #     compact_weight=0.02
     # )
 
     # Example 2: Checkerboard (2D)
@@ -619,8 +610,6 @@ if __name__ == "__main__":
     #     grid=4,
     #     noise=0.05,
     #     n_components=40,
-    #     dist_weight=0.0000001,
-    #     compact_weight=0.05
     # )
 
     # Example 3: Pinwheel (2D)
@@ -629,8 +618,6 @@ if __name__ == "__main__":
     #     n_arms=5,
     #     noise=0.05,
     #     n_components=25,
-    #     dist_weight=0.0000001,
-    #     compact_weight=0.03
     # )
 
     # ========== HIGH-DIMENSIONAL EXPERIMENTS ==========
@@ -641,8 +628,6 @@ if __name__ == "__main__":
     #     n_arms=2,
     #     noise=0.001,
     #     n_components=40,
-    #     dist_weight=0.0000001,
-    #     compact_weight=0.02,
     #     embed_dim=64,
     #     embed_seed=42
     # )
@@ -654,8 +639,6 @@ if __name__ == "__main__":
         noise=0.05,
         n_components=25,
         var_weight=0.0001,  # Weight for collapse prevention (log det regularization)
-        dist_weight=0.0000001,
-        compact_weight=0.03,
         embed_dim=200,
         embed_seed=42
     )
@@ -665,8 +648,6 @@ if __name__ == "__main__":
     #     dataset_name="swissroll",
     #     noise=0.05,
     #     n_components=30,
-    #     dist_weight=0.0000001,
-    #     compact_weight=0.03,
     #     embed_dim=1024,
     #     embed_seed=42
     # )
