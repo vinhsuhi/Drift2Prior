@@ -638,6 +638,7 @@ def train(
     batch_size = 512
     steps = 20000
     sigma = 0.1
+    sigma_conditional = 0.1
 
     def save_params(f):
         f.write(f"dataset: {dataset_name}\n")
@@ -651,6 +652,7 @@ def train(
         f.write(f"steps: {steps}\n")
         f.write(f"sigma: {sigma}\n")
         f.write(f"conditional_negative: {conditional_negative}\n")
+        f.write(f"sigma_conditional: {sigma_conditional}\n")
 
     with open(os.path.join(folder_name, "params.txt"), "w") as f:
         save_params(f)
@@ -752,12 +754,11 @@ def train(
     # Phase 4: Conditional Training #
     steps_conditional = 20000
     opt = optim.Adam(
-        list(G.parameters()) + list(prior.parameters()),
+        list(G.parameters()),
         lr=1e-3,
     )
-
+    assignments = prior.assign_to_components(real_data).to(device)
     for step in range(steps_conditional):
-        assignments = prior.assign_to_components(real_data)
         # Stratified sampling: batch_size per component, total n_components * batch_size
         y_list = []
         component_indices_list = []
@@ -819,7 +820,7 @@ def train(
                 x=x_k,
                 y_pos=y_pos_k,
                 y_neg=y_neg_k,
-                sigma=sigma,
+                sigma=sigma_conditional,
                 kernel_type=kernel_type,
             )
             v_list.append(v_k)
