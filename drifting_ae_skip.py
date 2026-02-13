@@ -572,7 +572,7 @@ def train(
     embed_seed=42,
     kernel_type="rbf",
     train_conditional=False,
-    full_neg=False,
+    conditional_negative="generated",
     **dataset_kwargs,
 ):
     """
@@ -585,7 +585,7 @@ def train(
         var_weight: weight for variance penalty (log-determinant)
         embed_dim: if specified, embed 2D data into this dimension via random rotation
         embed_seed: random seed for the embedding rotation
-        full_neg: if True, use full negative kernel for drifting field
+        conditional_negative: "full" if you want to compare against ALL possible negative samples, "generated" if you want to compare against only generated samples, "random" if you want to compare against random samples
         **dataset_kwargs: additional arguments for dataset generation
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -650,7 +650,7 @@ def train(
         f.write(f"batch_size: {batch_size}\n")
         f.write(f"steps: {steps}\n")
         f.write(f"sigma: {sigma}\n")
-        f.write(f"full_neg: {full_neg}\n")
+        f.write(f"conditional_negative: {conditional_negative}\n")
 
     with open(os.path.join(folder_name, "params.txt"), "w") as f:
         save_params(f)
@@ -798,13 +798,22 @@ def train(
             # y_pos: real data from this component
             y_pos_k = y_k
 
-            # y_neg: real data from other components + generated samples from this component
-            y_other = torch.cat([y[: k * batch_size], y[(k + 1) * batch_size :]], dim=0)
-            y_neg_k = torch.cat([y_other, x_k.detach()], dim=0)
-            if not full_neg:
-                n = len(y_neg_k)
-                batch_size_indxs = torch.randint(0, n, (batch_size,))
-                y_neg_k = y_neg_k[batch_size_indxs]
+            if conditional_negative in ["full", "generated"]:
+                # y_neg: real data from other components + generated samples from this component
+                y_other = torch.cat(
+                    [y[: k * batch_size], y[(k + 1) * batch_size :]], dim=0
+                )
+                y_neg_k = torch.cat([y_other, x_k.detach()], dim=0)
+                if conditional_negative == "random":
+                    n = len(y_neg_k)
+                    batch_size_indxs = torch.randint(0, n, (batch_size,))
+                    y_neg_k = y_neg_k[batch_size_indxs]
+            elif conditional_negative == "generated":
+                y_neg_k = x_k.detach()
+            else:
+                raise ValueError(
+                    f"Unknown conditional negative: {conditional_negative}"
+                )
             v_k = drifting_field(
                 x=x_k,
                 y_pos=y_pos_k,
@@ -920,13 +929,13 @@ if __name__ == "__main__":
         n_arms=5,
         noise=0.05,
         n_components=25,
-        id_weight=0.0,
+        id_weight=1.0,
         var_weight=0.0001,  # Weight for collapse prevention (log det regularization)
         embed_dim=4,
         embed_seed=42,
         kernel_type="rbf",
         train_conditional=True,
-        full_neg=False,
+        conditional_negative="generated",
     )
 
     # Example 6: Swiss roll embedded in 1024D
