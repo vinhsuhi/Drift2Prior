@@ -348,9 +348,11 @@ def l2_kernel(x, y, sigma):
 # ------------------------------------------------------------
 # Drifting field (Algorithm 1)
 # ------------------------------------------------------------
-def drifting_field(x, y_pos, y_neg, sigma, remove_self_repulsion=True):
-    k_pos = rbf_kernel(x, y_pos, sigma)
-    k_neg = rbf_kernel(x, y_neg, sigma)
+def drifting_field(
+    x, y_pos, y_neg, sigma, remove_self_repulsion=True, kernel_type="rbf"
+):
+    k_pos = kernel(x, y_pos, kernel_type, sigma=sigma)
+    k_neg = kernel(x, y_neg, kernel_type, sigma=sigma)
 
     if remove_self_repulsion:
         k_neg.fill_diagonal_(0.0)
@@ -535,6 +537,7 @@ def train(
     var_weight=0.0,
     embed_dim=None,
     embed_seed=42,
+    kernel_type="rbf",
     **dataset_kwargs,
 ):
     """
@@ -706,6 +709,7 @@ if __name__ == "__main__":
         var_weight=0.0001,  # Weight for collapse prevention (log det regularization)
         embed_dim=200,
         embed_seed=42,
+        kernel_type="l2",
     )
 
     # Example 6: Swiss roll embedded in 1024D
