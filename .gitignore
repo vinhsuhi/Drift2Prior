@@ -2,3 +2,4 @@ drifting_flow.py
 drift.py
 data.py
 plots/
+checkpoints/
