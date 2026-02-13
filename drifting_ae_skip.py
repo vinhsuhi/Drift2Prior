@@ -545,6 +545,7 @@ def train(
     embed_dim=None,
     embed_seed=42,
     kernel_type="rbf",
+    train_conditional=False,
     **dataset_kwargs,
 ):
     """
@@ -673,6 +674,8 @@ def train(
     plot_samples(
         G, prior, real_data, "final", n=6000, use_pca=use_pca, folder_name=folder_name
     )
+    if not train_conditional:
+        return
     # Phase 4: Conditional Training #
     steps_conditional = 10000
     for step in range(steps_conditional):
@@ -800,6 +803,7 @@ if __name__ == "__main__":
         embed_dim=2,
         embed_seed=42,
         kernel_type="rbf",
+        train_conditional=True,
     )
 
     # Example 6: Swiss roll embedded in 1024D
