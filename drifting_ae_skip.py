@@ -1,9 +1,12 @@
 import math
+import os
+import time
+
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
 from sklearn.datasets import make_circles
 from sklearn.decomposition import PCA
@@ -14,6 +17,7 @@ from sklearn.decomposition import PCA
 device = "cuda" if torch.cuda.is_available() else "cpu"
 # torch.manual_seed(0)
 # np.random.seed(0)
+
 
 # ------------------------------------------------------------
 # Spiral dataset
@@ -51,10 +55,13 @@ def make_checkerboard(n, noise=0.05, grid=4):
     for i in range(grid):
         for j in range(grid):
             if (i + j) % 2 == 0:
-                pts.append(np.random.uniform(
-                    [-2 + i*cell, -2 + j*cell],
-                    [-2 + (i+1)*cell, -2 + (j+1)*cell],
-                    (n // (grid**2 // 2), 2)))
+                pts.append(
+                    np.random.uniform(
+                        [-2 + i * cell, -2 + j * cell],
+                        [-2 + (i + 1) * cell, -2 + (j + 1) * cell],
+                        (n // (grid**2 // 2), 2),
+                    )
+                )
     c = np.vstack(pts)
     np.random.shuffle(c)
     return (c[:n] + np.random.randn(n, 2) * noise).astype(np.float32)
@@ -66,11 +73,15 @@ def make_pinwheel(n, n_arms=5, noise=0.05):
     pts = []
     for k in range(n_arms):
         r = np.linspace(0.1, 2.0, per_arm) + np.random.randn(per_arm) * 0.02
-        theta = np.linspace(0, 0.8*np.pi, per_arm) + k*2*np.pi/n_arms
-        pts.append(np.column_stack([
-            r*np.cos(theta) + np.random.randn(per_arm)*noise,
-            r*np.sin(theta) + np.random.randn(per_arm)*noise
-        ]))
+        theta = np.linspace(0, 0.8 * np.pi, per_arm) + k * 2 * np.pi / n_arms
+        pts.append(
+            np.column_stack(
+                [
+                    r * np.cos(theta) + np.random.randn(per_arm) * noise,
+                    r * np.sin(theta) + np.random.randn(per_arm) * noise,
+                ]
+            )
+        )
     c = np.vstack(pts)
     np.random.shuffle(c)
     return c[:n].astype(np.float32)
@@ -85,10 +96,10 @@ def make_rings(n, noise=0.03):
 def make_swissroll2d(n, noise=0.05):
     """Create a 2D Swiss roll dataset."""
     t = 1.5 * np.pi * (1 + 2 * np.random.rand(n))
-    return np.column_stack([
-        t*np.cos(t)/6,
-        t*np.sin(t)/6
-    ]).astype(np.float32) + np.random.randn(n, 2).astype(np.float32) * noise
+    return (
+        np.column_stack([t * np.cos(t) / 6, t * np.sin(t) / 6]).astype(np.float32)
+        + np.random.randn(n, 2).astype(np.float32) * noise
+    )
 
 
 # ------------------------------------------------------------
@@ -126,7 +137,7 @@ class GMMPrior(nn.Module):
 
         # Initialize means: sample random points from data + small perturbation
         # This ensures components start near actual data
-        indices = torch.randperm(data.size(0))[:self.k]
+        indices = torch.randperm(data.size(0))[: self.k]
         init_means = data[indices].clone()
 
         # Add small random perturbation to avoid exact duplicates
@@ -141,15 +152,15 @@ class GMMPrior(nn.Module):
 
         # Initialize Cholesky factors as scaled identity
         init_chol = torch.eye(self.z_dim, device=device) * init_scale
-        self.chol_factors = nn.Parameter(
-            init_chol.unsqueeze(0).repeat(self.k, 1, 1)
-        )
+        self.chol_factors = nn.Parameter(init_chol.unsqueeze(0).repeat(self.k, 1, 1))
 
         print(f"Initialized GMM prior from data:")
         print(f"  Data range: [{data_min.cpu().numpy()}, {data_max.cpu().numpy()}]")
         print(f"  Data std: {data_std.cpu().numpy()}")
         print(f"  Initial cluster scale: {init_scale:.4f}")
-        print(f"  Mean positions range: [{self.means.min().item():.2f}, {self.means.max().item():.2f}]")
+        print(
+            f"  Mean positions range: [{self.means.min().item():.2f}, {self.means.max().item():.2f}]"
+        )
 
     def covariance(self):
         """Return full covariance matrices for each component via Cholesky decomposition."""
@@ -195,7 +206,7 @@ class GMMPrior(nn.Module):
         More aggressive than trace penalty.
         """
         covs = self.covariance()  # (k, z_dim, z_dim)
-        frob_norm_sq = (covs ** 2).sum(dim=(1, 2))  # (k,)
+        frob_norm_sq = (covs**2).sum(dim=(1, 2))  # (k,)
         return frob_norm_sq.mean()
 
     def max_eigenvalue_penalty(self):
@@ -211,7 +222,7 @@ class GMMPrior(nn.Module):
     def distance_penalty(self):
         """Penalize small pairwise distances between component means."""
         diff = self.means[:, None, :] - self.means[None, :, :]
-        dist2 = (diff ** 2).sum(dim=-1)
+        dist2 = (diff**2).sum(dim=-1)
         # mask out diagonal (self-distances)
         mask = ~torch.eye(self.k, dtype=torch.bool, device=self.means.device)
         return (1.0 / (dist2[mask] + 1e-4)).sum()
@@ -241,17 +252,21 @@ class GMMPrior(nn.Module):
             # Compute inverse and determinant via Cholesky
             cov_k = covs[k]
             try:
-                L = torch.linalg.cholesky(cov_k + 1e-6 * torch.eye(self.z_dim, device=data.device))
+                L = torch.linalg.cholesky(
+                    cov_k + 1e-6 * torch.eye(self.z_dim, device=data.device)
+                )
                 log_det = 2 * torch.log(torch.diag(L)).sum()
 
                 # Solve L^T x = diff^T for Mahalanobis distance
                 v = torch.linalg.solve_triangular(L, diff.T, upper=False)
-                mahal_dist = (v ** 2).sum(dim=0)
+                mahal_dist = (v**2).sum(dim=0)
 
-                log_probs[:, k] = -0.5 * (mahal_dist + log_det + self.z_dim * np.log(2 * np.pi))
+                log_probs[:, k] = -0.5 * (
+                    mahal_dist + log_det + self.z_dim * np.log(2 * np.pi)
+                )
             except:
                 # Fallback to simple Euclidean distance if Cholesky fails
-                dist2 = (diff ** 2).sum(dim=1)
+                dist2 = (diff**2).sum(dim=1)
                 log_probs[:, k] = -dist2
 
         # Assign to component with highest log probability
@@ -291,15 +306,17 @@ class Generator(nn.Module):
             nn.Linear(hidden, z_dim),  # Output same dimension as input
         )
 
-        self.skip_weight = nn.Parameter(torch.tensor(1.0))  # Learnable skip connection weight
+        self.skip_weight = nn.Parameter(
+            torch.tensor(1.0)
+        )  # Learnable skip connection weight
 
-        self.linear_projection = nn.Linear(z_dim, z_dim)  # Linear projection for skip connection
-
+        self.linear_projection = nn.Linear(
+            z_dim, z_dim
+        )  # Linear projection for skip connection
 
     def forward(self, z):
         # Add skip connection to encourage identity mapping
         return self.net(z) + self.linear_projection(z) * self.skip_weight
-
 
 
 # ------------------------------------------------------------
@@ -307,8 +324,8 @@ class Generator(nn.Module):
 # ------------------------------------------------------------
 def rbf_kernel(x, y, sigma):
     diff = x[:, None, :] - y[None, :, :]
-    dist2 = (diff ** 2).sum(dim=-1)
-    return torch.exp(-dist2 / (2 * sigma ** 2))
+    dist2 = (diff**2).sum(dim=-1).sqrt()
+    return torch.exp(-dist2 / (2 * sigma**2))
 
 
 # ------------------------------------------------------------
@@ -334,13 +351,11 @@ def drifting_field(x, y_pos, y_neg, sigma, remove_self_repulsion=True):
 # Visualization
 # ------------------------------------------------------------
 @torch.no_grad()
-def plot_samples(G, prior, real_data, step, n=3000, use_pca=False):
+def plot_samples(G, prior, real_data, step, n=3000, use_pca=False, folder_name=""):
     z = prior.sample(n)
     x = G(z).cpu()
 
-    y = real_data[
-        torch.randint(0, real_data.size(0), (n,))
-    ].cpu()
+    y = real_data[torch.randint(0, real_data.size(0), (n,))].cpu()
 
     means = prior.means.cpu().numpy()
     covs = prior.covariance().cpu().numpy()
@@ -381,14 +396,23 @@ def plot_samples(G, prior, real_data, step, n=3000, use_pca=False):
             w, h = 2 * np.sqrt(eigvals)  # 1-std axes
             axes[0].add_patch(
                 Ellipse(
-                    means[k], w, h, angle=angle,
-                    fill=False, color="red", alpha=0.5,
+                    means[k],
+                    w,
+                    h,
+                    angle=angle,
+                    fill=False,
+                    color="red",
+                    alpha=0.5,
                 )
             )
 
     # Add dimension info and component count to title
     dim_info = f"dim={prior.z_dim}, k={prior.k}"
-    title_suffix = f" (PCA from dim {dim_info})" if use_pca and z.shape[1] > 2 else f" ({dim_info})"
+    title_suffix = (
+        f" (PCA from dim {dim_info})"
+        if use_pca and z.shape[1] > 2
+        else f" ({dim_info})"
+    )
 
     axes[0].set_title(f"Latent prior (step {step}){title_suffix}")
     axes[0].axis("equal")
@@ -401,7 +425,7 @@ def plot_samples(G, prior, real_data, step, n=3000, use_pca=False):
     axes[1].axis("equal")
 
     fig.tight_layout()
-    fig.savefig(f"step_{step}.png", dpi=150)
+    fig.savefig(os.path.join(folder_name, f"step_{step}.png"), dpi=150)
     plt.close(fig)
 
 
@@ -441,7 +465,9 @@ def embed_to_high_dim(data_2d, target_dim=1024, seed=None):
     print(f"  Embedded data shape: {data_rotated.shape}")
     print(f"  Data norm (before): {np.linalg.norm(data_2d, axis=1).mean():.4f}")
     print(f"  Data norm (after): {np.linalg.norm(data_rotated, axis=1).mean():.4f}")
-    print(f"  Non-zero entries: {(np.abs(data_rotated) > 1e-6).sum() / data_rotated.size * 100:.1f}%")
+    print(
+        f"  Non-zero entries: {(np.abs(data_rotated) > 1e-6).sum() / data_rotated.size * 100:.1f}%"
+    )
 
     return data_rotated
 
@@ -486,8 +512,14 @@ def get_dataset(dataset_name="spiral", n_samples=10000, **kwargs):
 # ------------------------------------------------------------
 # Training
 # ------------------------------------------------------------
-def train(dataset_name="spiral", n_components=8, var_weight=0.0,
-          embed_dim=None, embed_seed=42, **dataset_kwargs):
+def train(
+    dataset_name="spiral",
+    n_components=8,
+    var_weight=0.0,
+    embed_dim=None,
+    embed_seed=42,
+    **dataset_kwargs,
+):
     """
     Train the generator using drifting field with learnable GMM prior.
 
@@ -499,12 +531,19 @@ def train(dataset_name="spiral", n_components=8, var_weight=0.0,
         embed_seed: random seed for the embedding rotation
         **dataset_kwargs: additional arguments for dataset generation
     """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "mps" if torch.backends.mps.is_available() else device
+    folder_name = time.strftime("%Y%m%d_%H%M%S")
+    folder_name = f"plots/{folder_name}"
+    os.makedirs(folder_name, exist_ok=True)
     # fixed empirical dataset (2D)
     real_data_2d = get_dataset(dataset_name, n_samples=20000, **dataset_kwargs)
 
     # Optionally embed into high-dimensional space
     if embed_dim is not None and embed_dim > 2:
-        real_data_np = embed_to_high_dim(real_data_2d, target_dim=embed_dim, seed=embed_seed)
+        real_data_np = embed_to_high_dim(
+            real_data_2d, target_dim=embed_dim, seed=embed_seed
+        )
         z_dim = embed_dim
         use_pca = True
     else:
@@ -565,7 +604,7 @@ def train(dataset_name="spiral", n_components=8, var_weight=0.0,
         # We want to maximize log(det), so we minimize its negative
         collapse_loss = -var_penalty  # Negative because we want to maximize log det
 
-        loss = drift_loss + id_loss / embed_dim  + collapse_loss * var_weight / embed_dim
+        loss = drift_loss + id_loss / embed_dim + collapse_loss * var_weight / embed_dim
 
         opt.zero_grad()
         loss.backward()
@@ -581,10 +620,19 @@ def train(dataset_name="spiral", n_components=8, var_weight=0.0,
             )
 
         if step % 1000 == 0:
-            plot_samples(G, prior, real_data, step, n=6000, use_pca=use_pca)
+            plot_samples(
+                G,
+                prior,
+                real_data,
+                step,
+                n=6000,
+                use_pca=use_pca,
+                folder_name=folder_name,
+            )
 
-
-    plot_samples(G, prior, real_data, "final", n=6000, use_pca=use_pca)
+    plot_samples(
+        G, prior, real_data, "final", n=6000, use_pca=use_pca, folder_name=folder_name
+    )
 
 
 # ------------------------------------------------------------
@@ -640,7 +688,7 @@ if __name__ == "__main__":
         n_components=25,
         var_weight=0.0001,  # Weight for collapse prevention (log det regularization)
         embed_dim=200,
-        embed_seed=42
+        embed_seed=42,
     )
 
     # Example 6: Swiss roll embedded in 1024D
