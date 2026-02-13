@@ -606,12 +606,6 @@ def train(
         f.write(f"batch_size: {batch_size}\n")
         f.write(f"steps: {steps}\n")
         f.write(f"sigma: {sigma}\n")
-        f.write(f"real_data_2d: {real_data_2d.shape}\n")
-        f.write(f"real_data_np: {real_data_np.shape}\n")
-        f.write(f"real_data: {real_data.shape}\n")
-        f.write(f"G: {G.parameters()}\n")
-        f.write(f"prior: {prior.parameters()}\n")
-        f.write(f"opt: {opt.parameters()}\n")
 
     # phase 3: train the generator with drifting field
     # Now sample z from components corresponding to y
@@ -679,7 +673,7 @@ def train(
     plot_samples(
         G, prior, real_data, "final", n=6000, use_pca=use_pca, folder_name=folder_name
     )
-    # Phase 4: Conditional Training#
+    # Phase 4: Conditional Training #
     steps_conditional = 10000
     for step in range(steps_conditional):
         # First sample real data
@@ -803,7 +797,7 @@ if __name__ == "__main__":
         noise=0.05,
         n_components=25,
         var_weight=0.0001,  # Weight for collapse prevention (log det regularization)
-        embed_dim=200,
+        embed_dim=2,
         embed_seed=42,
         kernel_type="rbf",
     )
