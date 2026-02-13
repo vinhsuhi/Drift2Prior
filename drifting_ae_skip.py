@@ -572,6 +572,7 @@ def train(
     embed_seed=42,
     kernel_type="rbf",
     train_conditional=False,
+    full_neg=False,
     **dataset_kwargs,
 ):
     """
@@ -584,6 +585,7 @@ def train(
         var_weight: weight for variance penalty (log-determinant)
         embed_dim: if specified, embed 2D data into this dimension via random rotation
         embed_seed: random seed for the embedding rotation
+        full_neg: if True, use full negative kernel for drifting field
         **dataset_kwargs: additional arguments for dataset generation
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -621,10 +623,11 @@ def train(
 
     # Initialize GMM prior with data statistics for better coverage
     if precomputed:
-        prior = GMMPrior.load_state_dict(torch.load(prior_dir))
+        prior = GMMPrior(k=n_components, z_dim=z_dim).to(device)
+        prior.load_state_dict(torch.load(prior_dir, map_location=device))
     else:
         prior = GMMPrior(k=n_components, z_dim=z_dim, init_data=real_data).to(device)
-        prior.save(prior_dir)
+        torch.save(prior.state_dict(), prior_dir)
     # prior = GMMPrior(k=1, z_dim=z_dim, init_data=real_data).to(device)  # For ablation comparison
 
     opt = optim.Adam(
@@ -647,6 +650,7 @@ def train(
         f.write(f"batch_size: {batch_size}\n")
         f.write(f"steps: {steps}\n")
         f.write(f"sigma: {sigma}\n")
+        f.write(f"full_neg: {full_neg}\n")
 
     with open(os.path.join(folder_name, "params.txt"), "w") as f:
         save_params(f)
@@ -736,9 +740,9 @@ def train(
 
     else:
         prior = GMMPrior(k=n_components, z_dim=z_dim).to(device)
-        prior.load_state_dict(torch.load(prior_dir))
-        G = Generator().to(device)
-        G.load_state_dict(torch.load(generator_dir))
+        prior.load_state_dict(torch.load(prior_dir, map_location=device))
+        G = Generator(z_dim=z_dim).to(device)
+        G.load_state_dict(torch.load(generator_dir, map_location=device))
         opt = optim.Adam(
             list(G.parameters()) + list(prior.parameters()),
             lr=1e-3,
@@ -797,7 +801,10 @@ def train(
             # y_neg: real data from other components + generated samples from this component
             y_other = torch.cat([y[: k * batch_size], y[(k + 1) * batch_size :]], dim=0)
             y_neg_k = torch.cat([y_other, x_k.detach()], dim=0)
-
+            if not full_neg:
+                n = len(y_neg_k)
+                batch_size_indxs = torch.randint(0, n, (batch_size,))
+                y_neg_k = y_neg_k[batch_size_indxs]
             v_k = drifting_field(
                 x=x_k,
                 y_pos=y_pos_k,
@@ -919,6 +926,7 @@ if __name__ == "__main__":
         embed_seed=42,
         kernel_type="rbf",
         train_conditional=True,
+        full_neg=False,
     )
 
     # Example 6: Swiss roll embedded in 1024D
