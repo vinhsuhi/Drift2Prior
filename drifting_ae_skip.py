@@ -181,17 +181,25 @@ class GMMPrior(nn.Module):
         cov = torch.bmm(L, L.transpose(1, 2))
         return cov
 
-    def sample(self, n):
+    def sample(self, n, generator=None):
         # uniform mixture weights
-        comp = torch.randint(0, self.k, (n,), device=self.means.device)
+        comp = torch.randint(0, self.k, (n,), generator=generator).to(self.means.device)
 
         # Standard normal samples
-        eps = torch.randn(n, self.z_dim, device=self.means.device)
+        eps = torch.randn(n, self.z_dim, generator=generator).to(self.means.device)
 
         # Transform using Cholesky factor: z = mu + L @ eps
         L = torch.tril(self.chol_factors[comp])  # (n, z_dim, z_dim)
         z = self.means[comp] + torch.bmm(L, eps.unsqueeze(-1)).squeeze(-1)
         return z
+
+    def sample_with_indices(self, n, generator=None):
+        """Sample from the GMM and return both the samples and component indices."""
+        comp = torch.randint(0, self.k, (n,), generator=generator).to(self.means.device)
+        eps = torch.randn(n, self.z_dim, generator=generator).to(self.means.device)
+        L = torch.tril(self.chol_factors[comp])
+        z = self.means[comp] + torch.bmm(L, eps.unsqueeze(-1)).squeeze(-1)
+        return z, comp
 
     def variance_penalty(self):
         """Penalize the determinant (volume) of covariance matrices."""
@@ -314,10 +322,14 @@ class GMMPrior(nn.Module):
 # Generator network
 # ------------------------------------------------------------
 class Generator(nn.Module):
-    def __init__(self, z_dim=2, hidden=32):
+    def __init__(self, z_dim=2, hidden=32, cond_dim=0):
         super().__init__()
+        self.z_dim = z_dim
+        self.cond_dim = cond_dim
+        input_dim = z_dim + cond_dim
+
         self.net = nn.Sequential(
-            nn.Linear(z_dim, hidden),
+            nn.Linear(input_dim, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
@@ -332,9 +344,13 @@ class Generator(nn.Module):
             z_dim, z_dim
         )  # Linear projection for skip connection
 
-    def forward(self, z):
+    def forward(self, z, cond=None):
+        if cond is not None:
+            net_input = torch.cat([z, cond], dim=-1)
+        else:
+            net_input = z
         # Add skip connection to encourage identity mapping
-        return self.net(z) + self.linear_projection(z) * self.skip_weight
+        return self.net(net_input) + self.linear_projection(z) * self.skip_weight
 
 
 # ------------------------------------------------------------
@@ -398,10 +414,15 @@ def plot_samples(
     folder_name="",
     custom_name=None,
 ):
-    z = prior.sample(n)
-    x = G(z).cpu()
+    rng = torch.Generator(device="cpu").manual_seed(42)
+    z, comp = prior.sample_with_indices(n, generator=rng)
+    if hasattr(G, "cond_dim") and G.cond_dim > 0:
+        cond = prior.means[comp].detach()
+        x = G(z, cond=cond).cpu()
+    else:
+        x = G(z).cpu()
 
-    y = real_data[torch.randint(0, real_data.size(0), (n,))].cpu()
+    y = real_data[torch.randint(0, real_data.size(0), (n,), generator=rng)].cpu()
 
     means = prior.means.cpu().numpy()
     covs = prior.covariance().cpu().numpy()
@@ -431,7 +452,8 @@ def plot_samples(
     fig, axes = plt.subplots(1, 2, figsize=(10, 5))
 
     # latent space
-    axes[0].scatter(z_2d[:, 0], z_2d[:, 1], s=3, alpha=0.3)
+    axes[0].scatter(y_2d[:, 0], y_2d[:, 1], s=5, alpha=0.3, label="real")
+    axes[0].scatter(z_2d[:, 0], z_2d[:, 1], s=5, alpha=0.7, label="prior")
     axes[0].scatter(means_2d[:, 0], means_2d[:, 1], s=80, c="red", marker="x")
 
     if plot_ellipses and z.shape[1] == 2:
@@ -460,7 +482,8 @@ def plot_samples(
         else f" ({dim_info})"
     )
 
-    axes[0].set_title(f"Latent prior (step {step}){title_suffix}")
+    axes[0].legend()
+    axes[0].set_title(f"Latent space (step {step}){title_suffix}")
     axes[0].axis("equal")
 
     # data space
@@ -657,7 +680,7 @@ def train(
     with open(os.path.join(checkpoint_dir, "params.txt"), "w") as f:
         save_params(f)
 
-    # phase 3: train the generator with drifting field
+    # phase 1: train the generator with drifting field
     # Now sample z from components corresponding to y
     if not precomputed:
         for step in range(steps):
@@ -720,7 +743,7 @@ def train(
                     prior,
                     real_data,
                     step,
-                    n=6000,
+                    n=12000,
                     use_pca=use_pca,
                     folder_name=folder_name,
                 )
@@ -730,7 +753,7 @@ def train(
             prior,
             real_data,
             "final",
-            n=6000,
+            n=12000,
             use_pca=use_pca,
             folder_name=folder_name,
         )
@@ -749,13 +772,33 @@ def train(
         )
     if not train_conditional:
         return
-    # Phase 4: Conditional Training #
+    # Phase 2: Conditional Training (conditioned on cluster mean) #
     steps_conditional = 20000
+
+    # Create conditional generator and transfer weights from phase 1
+    G_cond = Generator(z_dim=z_dim, cond_dim=z_dim).to(device)
+    with torch.no_grad():
+        # First layer: copy z_dim weights, zero-init cond_dim weights
+        # so G_cond initially behaves identically to phase 1 G
+        G_cond.net[0].weight[:, :z_dim] = G.net[0].weight
+        G_cond.net[0].weight[:, z_dim:] = 0.0
+        G_cond.net[0].bias.copy_(G.net[0].bias)
+        # Copy remaining layers directly
+        G_cond.net[2].weight.copy_(G.net[2].weight)
+        G_cond.net[2].bias.copy_(G.net[2].bias)
+        G_cond.net[4].weight.copy_(G.net[4].weight)
+        G_cond.net[4].bias.copy_(G.net[4].bias)
+        # Copy skip connection
+        G_cond.skip_weight.copy_(G.skip_weight)
+        G_cond.linear_projection.weight.copy_(G.linear_projection.weight)
+        G_cond.linear_projection.bias.copy_(G.linear_projection.bias)
+
     opt = optim.Adam(
-        list(G.parameters()) + list(prior.parameters()),
+        list(G_cond.parameters()),
         lr=1e-3,
     )
     assignments = prior.assign_to_components(real_data)
+    batch_size = 128
     for step in range(steps_conditional):
         # Stratified sampling: batch_size per component, total n_components * batch_size
         y_list = []
@@ -785,11 +828,15 @@ def train(
         component_indices = torch.cat(component_indices_list, dim=0)
         z = prior.sample_from_components(component_indices)
 
-        # generate samples
-        x = G(z)
+        # Condition on the mean of the assigned cluster
+        cluster_means = prior.means[component_indices].detach()
+
+        # generate samples (conditioned on cluster mean)
+        x = G_cond(z, cond=cluster_means)
 
         # drifting field: compute v per component with component-specific y_pos / y_neg
         v_list = []
+        sigma = 0.01
         for k in range(n_components):
             # B samples for this component
             x_k = x[k * batch_size : (k + 1) * batch_size]
@@ -799,8 +846,9 @@ def train(
             y_pos_k = y_k
 
             # y_neg: real data from other components + generated samples from this component
-            y_other = torch.cat([y[: k * batch_size], y[(k + 1) * batch_size :]], dim=0)
-            y_neg_k = torch.cat([y_other, x_k.detach()], dim=0)
+            # y_other = torch.cat([y[: k * batch_size], y[(k + 1) * batch_size :]], dim=0)
+            # y_neg_k = torch.cat([y_other, x_k.detach()], dim=0)
+            y_neg_k = x_k.detach()
             if not full_neg:
                 n = len(y_neg_k)
                 batch_size_indxs = torch.randint(0, n, (batch_size,))
@@ -823,47 +871,37 @@ def train(
         # losses
         drift_loss = ((x - x_drift) ** 2).sum(dim=1).mean()
 
-        # Regularization to prevent component collapse
-        var_penalty = prior.variance_penalty()
-        collapse_loss = -var_penalty
-
-        loss = (
-            drift_loss
-            + id_weight * id_loss / embed_dim
-            + collapse_loss * var_weight / embed_dim
-        )
+        loss = drift_loss
 
         opt.zero_grad()
         loss.backward()
         opt.step()
 
-        if step % 500 == 0:
+        if step % 200 == 0:
             print(
                 f"step {step:5d} | "
                 f"drift {drift_loss.item():.6f} | "
                 f"id {id_loss.item():.6f} | "
-                f"log_det {var_penalty.item():.4f} | "
-                f"collapse {collapse_loss.item():.6f}"
             )
 
-        if step % 1000 == 0:
+        if step % 200 == 0:
             plot_samples(
-                G,
+                G_cond,
                 prior,
                 real_data,
                 step,
-                n=6000,
+                n=12000,
                 use_pca=use_pca,
                 folder_name=folder_name,
                 custom_name="conditional",
             )
 
     plot_samples(
-        G,
+        G_cond,
         prior,
         real_data,
         "final_conditional",
-        n=6000,
+        n=12000,
         use_pca=use_pca,
         folder_name=folder_name,
     )
@@ -918,11 +956,11 @@ if __name__ == "__main__":
     train(
         dataset_name="pinwheel",
         n_arms=5,
-        noise=0.05,
+        noise=0.03,
         n_components=25,
         id_weight=0.0,
         var_weight=0.0001,  # Weight for collapse prevention (log det regularization)
-        embed_dim=4,
+        embed_dim=3,
         embed_seed=42,
         kernel_type="rbf",
         train_conditional=True,
