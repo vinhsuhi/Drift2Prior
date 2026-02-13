@@ -679,7 +679,7 @@ def train(
     plot_samples(
         G, prior, real_data, "final", n=6000, use_pca=use_pca, folder_name=folder_name
     )
-    # Phase 2: Conditional Training#
+    # Phase 4: Conditional Training#
     steps_conditional = 10000
     for step in range(steps_conditional):
         # First sample real data
