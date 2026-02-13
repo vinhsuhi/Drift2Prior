@@ -607,6 +607,7 @@ def train(
             y_pos=y,
             y_neg=x.detach(),
             sigma=sigma,
+            kernel_type=kernel_type,
         )
 
         # stop-gradient target
