@@ -370,7 +370,9 @@ def drifting_field(
 # Visualization
 # ------------------------------------------------------------
 @torch.no_grad()
-def plot_samples(G, prior, real_data, step, n=3000, use_pca=False, folder_name=""):
+def plot_samples(
+    G, prior, real_data, step, n=3000, use_pca=False, folder_name="", custom_name=None
+):
     z = prior.sample(n)
     x = G(z).cpu()
 
@@ -444,7 +446,12 @@ def plot_samples(G, prior, real_data, step, n=3000, use_pca=False, folder_name="
     axes[1].axis("equal")
 
     fig.tight_layout()
-    fig.savefig(os.path.join(folder_name, f"step_{step}.png"), dpi=150)
+    if custom_name is not None:
+        fig.savefig(
+            os.path.join(folder_name, f"{custom_name}_step_{step}.png"), dpi=150
+        )
+    else:
+        fig.savefig(os.path.join(folder_name, f"step_{step}.png"), dpi=150)
     plt.close(fig)
 
 
@@ -585,8 +592,26 @@ def train(
     )
 
     batch_size = 512
-    steps = 200000
+    steps = 10000
     sigma = 0.1
+
+    # Save txt with params and dataset
+    with open(os.path.join(folder_name, "params.txt"), "w") as f:
+        f.write(f"dataset: {dataset_name}\n")
+        f.write(f"n_components: {n_components}\n")
+        f.write(f"var_weight: {var_weight}\n")
+        f.write(f"embed_dim: {embed_dim}\n")
+        f.write(f"embed_seed: {embed_seed}\n")
+        f.write(f"kernel_type: {kernel_type}\n")
+        f.write(f"batch_size: {batch_size}\n")
+        f.write(f"steps: {steps}\n")
+        f.write(f"sigma: {sigma}\n")
+        f.write(f"real_data_2d: {real_data_2d.shape}\n")
+        f.write(f"real_data_np: {real_data_np.shape}\n")
+        f.write(f"real_data: {real_data.shape}\n")
+        f.write(f"G: {G.parameters()}\n")
+        f.write(f"prior: {prior.parameters()}\n")
+        f.write(f"opt: {opt.parameters()}\n")
 
     # phase 3: train the generator with drifting field
     # Now sample z from components corresponding to y
@@ -654,6 +679,76 @@ def train(
     plot_samples(
         G, prior, real_data, "final", n=6000, use_pca=use_pca, folder_name=folder_name
     )
+    # Phase 2: Conditional Training#
+    steps_conditional = 10000
+    for step in range(steps_conditional):
+        # First sample real data
+        idx = torch.randint(0, real_data.size(0), (batch_size,))
+        y = real_data[idx]
+
+        # Sample z from the Gaussian components assigned to y
+        component_indices = prior.assign_to_components(y)
+        z = prior.sample_from_components(component_indices)
+
+        # generate samples
+        x = G(z)
+
+        # drifting field
+        v = drifting_field(
+            x=x,
+            y_pos=y,
+            y_neg=x.detach(),
+            sigma=sigma,
+            kernel_type=kernel_type,
+        )
+
+        # stop-gradient target
+        x_drift = (x + v).detach()
+        id_loss = ((x - z) ** 2).sum(dim=1).mean()
+
+        # losses
+        drift_loss = ((x - x_drift) ** 2).sum(dim=1).mean()
+
+        # Regularization to prevent component collapse
+        var_penalty = prior.variance_penalty()
+        collapse_loss = -var_penalty
+
+        loss = drift_loss + id_loss / embed_dim + collapse_loss * var_weight / embed_dim
+
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        if step % 500 == 0:
+            print(
+                f"step {step:5d} | "
+                f"drift {drift_loss.item():.6f} | "
+                f"id {id_loss.item():.6f} | "
+                f"log_det {var_penalty.item():.4f} | "
+                f"collapse {collapse_loss.item():.6f}"
+            )
+
+        if step % 1000 == 0:
+            plot_samples(
+                G,
+                prior,
+                real_data,
+                step,
+                n=6000,
+                use_pca=use_pca,
+                folder_name=folder_name,
+                custom_name="conditional",
+            )
+
+    plot_samples(
+        G,
+        prior,
+        real_data,
+        "final_conditional",
+        n=6000,
+        use_pca=use_pca,
+        folder_name=folder_name,
+    )
 
 
 # ------------------------------------------------------------
@@ -710,7 +805,7 @@ if __name__ == "__main__":
         var_weight=0.0001,  # Weight for collapse prevention (log det regularization)
         embed_dim=200,
         embed_seed=42,
-        kernel_type="l2",
+        kernel_type="rbf",
     )
 
     # Example 6: Swiss roll embedded in 1024D
@@ -720,4 +815,12 @@ if __name__ == "__main__":
     #     n_components=30,
     #     embed_dim=1024,
     #     embed_seed=42
+    # )
+
+    # test_conditional_matching(
+    #     dataset_name="spiral",
+    #     n_components=25,
+    #     embed_dim=200,
+    #     embed_seed=42,
+    #     kernel_type="l2",
     # )
