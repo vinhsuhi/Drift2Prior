@@ -1,5 +1,6 @@
 import math
 import os
+import random
 import time
 
 import matplotlib.pyplot as plt
@@ -15,8 +16,19 @@ from sklearn.decomposition import PCA
 # Device & seed
 # ------------------------------------------------------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+
 # torch.manual_seed(0)
 # np.random.seed(0)
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.mps.deterministic = True
+    torch.backends.mps.benchmark = False
 
 
 # ------------------------------------------------------------
@@ -291,6 +303,12 @@ class GMMPrior(nn.Module):
         z = self.means[component_indices] + torch.bmm(L, eps.unsqueeze(-1)).squeeze(-1)
         return z
 
+    def save(self, path):
+        torch.save(self.state_dict(), path)
+
+    def load(self, path):
+        self.load_state_dict(torch.load(path))
+
 
 # ------------------------------------------------------------
 # Generator network
@@ -370,7 +388,16 @@ def drifting_field(
 # Visualization
 # ------------------------------------------------------------
 @torch.no_grad()
-def plot_samples(G, prior, real_data, step, n=3000, use_pca=False, folder_name=""):
+def plot_samples(
+    G,
+    prior,
+    real_data,
+    step,
+    n=3000,
+    use_pca=False,
+    folder_name="",
+    custom_name=None,
+):
     z = prior.sample(n)
     x = G(z).cpu()
 
@@ -444,7 +471,12 @@ def plot_samples(G, prior, real_data, step, n=3000, use_pca=False, folder_name="
     axes[1].axis("equal")
 
     fig.tight_layout()
-    fig.savefig(os.path.join(folder_name, f"step_{step}.png"), dpi=150)
+    if custom_name is not None:
+        fig.savefig(
+            os.path.join(folder_name, f"{custom_name}_step_{step}.png"), dpi=150
+        )
+    else:
+        fig.savefig(os.path.join(folder_name, f"step_{step}.png"), dpi=150)
     plt.close(fig)
 
 
@@ -534,10 +566,12 @@ def get_dataset(dataset_name="spiral", n_samples=10000, **kwargs):
 def train(
     dataset_name="spiral",
     n_components=8,
+    id_weight=1.0,
     var_weight=0.0,
     embed_dim=None,
     embed_seed=42,
     kernel_type="rbf",
+    train_conditional=False,
     **dataset_kwargs,
 ):
     """
@@ -546,6 +580,7 @@ def train(
     Args:
         dataset_name: name of dataset to use (spiral, checkerboard, pinwheel, rings, swissroll)
         n_components: number of Gaussian components in the mixture
+        id_weight: weight for identity loss FOR THE CONDITIONAL TRAINING
         var_weight: weight for variance penalty (log-determinant)
         embed_dim: if specified, embed 2D data into this dimension via random rotation
         embed_seed: random seed for the embedding rotation
@@ -556,9 +591,18 @@ def train(
     folder_name = time.strftime("%Y%m%d_%H%M%S")
     folder_name = f"plots/{folder_name}"
     os.makedirs(folder_name, exist_ok=True)
+    seed = 42
+    seed_everything(seed)
     # fixed empirical dataset (2D)
     real_data_2d = get_dataset(dataset_name, n_samples=20000, **dataset_kwargs)
-
+    checkpoint_folder_name = f"dataset_{dataset_name}_n_components_{n_components}_var_weight_{var_weight}_embed_dim_{embed_dim}_embed_seed_{embed_seed}_kernel_type_{kernel_type}"
+    checkpoint_dir = f"checkpoints/{checkpoint_folder_name}"
+    precomputed = False
+    if os.path.exists(checkpoint_dir):
+        precomputed = True
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    prior_dir = f"checkpoints/{checkpoint_folder_name}/prior.pth"
+    generator_dir = f"checkpoints/{checkpoint_folder_name}/generator.pth"
     # Optionally embed into high-dimensional space
     if embed_dim is not None and embed_dim > 2:
         real_data_np = embed_to_high_dim(
@@ -576,7 +620,11 @@ def train(
     G = Generator(z_dim=z_dim).to(device)
 
     # Initialize GMM prior with data statistics for better coverage
-    prior = GMMPrior(k=n_components, z_dim=z_dim, init_data=real_data).to(device)
+    if precomputed:
+        prior = GMMPrior.load_state_dict(torch.load(prior_dir))
+    else:
+        prior = GMMPrior(k=n_components, z_dim=z_dim, init_data=real_data).to(device)
+        prior.save(prior_dir)
     # prior = GMMPrior(k=1, z_dim=z_dim, init_data=real_data).to(device)  # For ablation comparison
 
     opt = optim.Adam(
@@ -585,30 +633,181 @@ def train(
     )
 
     batch_size = 512
-    steps = 200000
+    steps = 20000
     sigma = 0.1
+
+    def save_params(f):
+        f.write(f"dataset: {dataset_name}\n")
+        f.write(f"n_components: {n_components}\n")
+        f.write(f"id_weight: {id_weight}\n")
+        f.write(f"var_weight: {var_weight}\n")
+        f.write(f"embed_dim: {embed_dim}\n")
+        f.write(f"embed_seed: {embed_seed}\n")
+        f.write(f"kernel_type: {kernel_type}\n")
+        f.write(f"batch_size: {batch_size}\n")
+        f.write(f"steps: {steps}\n")
+        f.write(f"sigma: {sigma}\n")
+
+    with open(os.path.join(folder_name, "params.txt"), "w") as f:
+        save_params(f)
+    with open(os.path.join(checkpoint_dir, "params.txt"), "w") as f:
+        save_params(f)
 
     # phase 3: train the generator with drifting field
     # Now sample z from components corresponding to y
-    for step in range(steps):
-        # First sample real data
-        idx = torch.randint(0, real_data.size(0), (batch_size,))
-        y = real_data[idx]
+    if not precomputed:
+        for step in range(steps):
+            # First sample real data
+            idx = torch.randint(0, real_data.size(0), (batch_size,))
+            y = real_data[idx]
 
-        # Sample z from the Gaussian components assigned to y
-        z = prior.sample(batch_size)  # Sample from the entire prior for diversity
+            # Sample z from the Gaussian components assigned to y
+            z = prior.sample(batch_size)  # Sample from the entire prior for diversity
+
+            # generate samples
+            x = G(z)
+
+            # drifting field
+            v = drifting_field(
+                x=x,
+                y_pos=y,
+                y_neg=x.detach(),
+                sigma=sigma,
+                kernel_type=kernel_type,
+            )
+
+            # stop-gradient target
+            x_drift = (x + v).detach()
+            id_loss = ((x - z) ** 2).sum(dim=1).mean()
+
+            # losses
+            drift_loss = ((x - x_drift) ** 2).sum(dim=1).mean()
+
+            # Regularization to prevent component collapse
+            # Penalize small determinants (collapsed components)
+            var_penalty = prior.variance_penalty()
+
+            # Encourage positive log determinant (non-collapsed components)
+            # We want to maximize log(det), so we minimize its negative
+            collapse_loss = -var_penalty  # Negative because we want to maximize log det
+
+            loss = (
+                drift_loss
+                + id_loss / embed_dim
+                + collapse_loss * var_weight / embed_dim
+            )
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            if step % 500 == 0:
+                print(
+                    f"step {step:5d} | "
+                    f"drift {drift_loss.item():.6f} | "
+                    f"id {id_loss.item():.6f} | "
+                    f"log_det {var_penalty.item():.4f} | "
+                    f"collapse {collapse_loss.item():.6f}"
+                )
+
+            if step % 1000 == 0:
+                plot_samples(
+                    G,
+                    prior,
+                    real_data,
+                    step,
+                    n=6000,
+                    use_pca=use_pca,
+                    folder_name=folder_name,
+                )
+
+        plot_samples(
+            G,
+            prior,
+            real_data,
+            "final",
+            n=6000,
+            use_pca=use_pca,
+            folder_name=folder_name,
+        )
+
+        torch.save(prior.state_dict(), prior_dir)
+        torch.save(G.state_dict(), generator_dir)
+
+    else:
+        prior = GMMPrior(k=n_components, z_dim=z_dim).to(device)
+        prior.load_state_dict(torch.load(prior_dir))
+        G = Generator().to(device)
+        G.load_state_dict(torch.load(generator_dir))
+        opt = optim.Adam(
+            list(G.parameters()) + list(prior.parameters()),
+            lr=1e-3,
+        )
+    if not train_conditional:
+        return
+    # Phase 4: Conditional Training #
+    steps_conditional = 20000
+    opt = optim.Adam(
+        list(G.parameters()) + list(prior.parameters()),
+        lr=1e-3,
+    )
+    assignments = prior.assign_to_components(real_data)
+    for step in range(steps_conditional):
+        # Stratified sampling: batch_size per component, total n_components * batch_size
+        y_list = []
+        component_indices_list = []
+
+        for k in range(n_components):
+            indices_k = torch.where(assignments == k)[0]
+
+            if indices_k.numel() == 0:
+                # Fallback: sample from whole dataset if component has no assigned points
+                idx_k = torch.randint(
+                    0, real_data.size(0), (batch_size,), device=real_data.device
+                )
+                selected = idx_k
+            else:
+                idx_k = torch.randint(
+                    0, indices_k.numel(), (batch_size,), device=real_data.device
+                )
+                selected = indices_k[idx_k]
+
+            y_list.append(real_data[selected])
+            component_indices_list.append(
+                torch.full((batch_size,), k, dtype=torch.long, device=real_data.device)
+            )
+
+        y = torch.cat(y_list, dim=0)
+        component_indices = torch.cat(component_indices_list, dim=0)
+        z = prior.sample_from_components(component_indices)
 
         # generate samples
         x = G(z)
 
-        # drifting field
-        v = drifting_field(
-            x=x,
-            y_pos=y,
-            y_neg=x.detach(),
-            sigma=sigma,
-            kernel_type=kernel_type,
-        )
+        # drifting field: compute v per component with component-specific y_pos / y_neg
+        v_list = []
+        for k in range(n_components):
+            # B samples for this component
+            x_k = x[k * batch_size : (k + 1) * batch_size]
+            y_k = y[k * batch_size : (k + 1) * batch_size]
+
+            # y_pos: real data from this component
+            y_pos_k = y_k
+
+            # y_neg: real data from other components + generated samples from this component
+            y_other = torch.cat([y[: k * batch_size], y[(k + 1) * batch_size :]], dim=0)
+            y_neg_k = torch.cat([y_other, x_k.detach()], dim=0)
+
+            v_k = drifting_field(
+                x=x_k,
+                y_pos=y_pos_k,
+                y_neg=y_neg_k,
+                sigma=sigma,
+                kernel_type=kernel_type,
+            )
+            v_list.append(v_k)
+
+        v = torch.cat(v_list, dim=0)
 
         # stop-gradient target
         x_drift = (x + v).detach()
@@ -618,14 +817,14 @@ def train(
         drift_loss = ((x - x_drift) ** 2).sum(dim=1).mean()
 
         # Regularization to prevent component collapse
-        # Penalize small determinants (collapsed components)
         var_penalty = prior.variance_penalty()
+        collapse_loss = -var_penalty
 
-        # Encourage positive log determinant (non-collapsed components)
-        # We want to maximize log(det), so we minimize its negative
-        collapse_loss = -var_penalty  # Negative because we want to maximize log det
-
-        loss = drift_loss + id_loss / embed_dim + collapse_loss * var_weight / embed_dim
+        loss = (
+            drift_loss
+            + id_weight * id_loss / embed_dim
+            + collapse_loss * var_weight / embed_dim
+        )
 
         opt.zero_grad()
         loss.backward()
@@ -649,10 +848,17 @@ def train(
                 n=6000,
                 use_pca=use_pca,
                 folder_name=folder_name,
+                custom_name="conditional",
             )
 
     plot_samples(
-        G, prior, real_data, "final", n=6000, use_pca=use_pca, folder_name=folder_name
+        G,
+        prior,
+        real_data,
+        "final_conditional",
+        n=6000,
+        use_pca=use_pca,
+        folder_name=folder_name,
     )
 
 
@@ -707,10 +913,12 @@ if __name__ == "__main__":
         n_arms=5,
         noise=0.05,
         n_components=25,
+        id_weight=0.0,
         var_weight=0.0001,  # Weight for collapse prevention (log det regularization)
-        embed_dim=200,
+        embed_dim=4,
         embed_seed=42,
-        kernel_type="l2",
+        kernel_type="rbf",
+        train_conditional=True,
     )
 
     # Example 6: Swiss roll embedded in 1024D
@@ -720,4 +928,12 @@ if __name__ == "__main__":
     #     n_components=30,
     #     embed_dim=1024,
     #     embed_seed=42
+    # )
+
+    # test_conditional_matching(
+    #     dataset_name="spiral",
+    #     n_components=25,
+    #     embed_dim=200,
+    #     embed_seed=42,
+    #     kernel_type="l2",
     # )
