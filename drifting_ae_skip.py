@@ -755,8 +755,9 @@ def train(
         list(G.parameters()) + list(prior.parameters()),
         lr=1e-3,
     )
-    assignments = prior.assign_to_components(real_data)
+
     for step in range(steps_conditional):
+        assignments = prior.assign_to_components(real_data)
         # Stratified sampling: batch_size per component, total n_components * batch_size
         y_list = []
         component_indices_list = []
