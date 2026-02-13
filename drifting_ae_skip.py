@@ -320,12 +320,29 @@ class Generator(nn.Module):
 
 
 # ------------------------------------------------------------
-# RBF kernel
+# Kernels
 # ------------------------------------------------------------
+
+
+def kernel(x, y, kernel_type, **kwargs):
+    if kernel_type == "rbf":
+        return rbf_kernel(x, y, **kwargs)
+    elif kernel_type == "l2":
+        return l2_kernel(x, y, **kwargs)
+    else:
+        raise ValueError(f"Unknown kernel type: {kernel_type}")
+
+
 def rbf_kernel(x, y, sigma):
     diff = x[:, None, :] - y[None, :, :]
-    dist2 = (diff**2).sum(dim=-1).sqrt()
+    dist2 = (diff**2).sum(dim=-1)
     return torch.exp(-dist2 / (2 * sigma**2))
+
+
+def l2_kernel(x, y, sigma):
+    diff = x[:, None, :] - y[None, :, :]
+    dist = torch.norm(diff, dim=-1)
+    return torch.exp(-dist / sigma)
 
 
 # ------------------------------------------------------------
