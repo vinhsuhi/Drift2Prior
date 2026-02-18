@@ -1,0 +1,674 @@
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
+from sklearn.datasets import make_circles
+
+# ------------------------------------------------------------
+# Device & seed
+# ------------------------------------------------------------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+# torch.manual_seed(0)
+# np.random.seed(0)
+
+# ------------------------------------------------------------
+# Spiral dataset
+# ------------------------------------------------------------
+def make_spiral(n_samples, noise=0.01, start=0.0, stop=2 * math.pi):
+    t = np.linspace(start, stop, n_samples)
+    t += np.random.randn(n_samples) * 0.02
+
+    r = 0.5 + 1.5 * (t - t.min()) / (t.max() - t.min() + 1e-8)
+    x = r * np.cos(t) + np.random.randn(n_samples) * noise
+    y = r * np.sin(t) + np.random.randn(n_samples) * noise
+
+    return np.stack([x, y], axis=1).astype(np.float32)
+
+
+def make_multi_spiral(n_samples_per_arm, n_arms=2, noise=0.01):
+    points = []
+    for i in range(n_arms):
+        start = i * (2 * math.pi / n_arms)
+        stop = start + 2 * math.pi
+        arm = make_spiral(
+            n_samples_per_arm,
+            noise=noise,
+            start=start,
+            stop=stop,
+        )
+        points.append(arm)
+    return np.concatenate(points, axis=0)
+
+
+def make_checkerboard(n, noise=0.05, grid=4):
+    """Create a checkerboard pattern dataset."""
+    pts = []
+    cell = 4.0 / grid
+    for i in range(grid):
+        for j in range(grid):
+            if (i + j) % 2 == 0:
+                pts.append(np.random.uniform(
+                    [-2 + i*cell, -2 + j*cell],
+                    [-2 + (i+1)*cell, -2 + (j+1)*cell],
+                    (n // (grid**2 // 2), 2)))
+    c = np.vstack(pts)
+    np.random.shuffle(c)
+    return (c[:n] + np.random.randn(n, 2) * noise).astype(np.float32)
+
+
+def make_pinwheel(n, n_arms=5, noise=0.05):
+    """Create a pinwheel pattern dataset."""
+    per_arm = n // n_arms
+    pts = []
+    for k in range(n_arms):
+        r = np.linspace(0.1, 2.0, per_arm) + np.random.randn(per_arm) * 0.02
+        theta = np.linspace(0, 0.8*np.pi, per_arm) + k*2*np.pi/n_arms
+        pts.append(np.column_stack([
+            r*np.cos(theta) + np.random.randn(per_arm)*noise,
+            r*np.sin(theta) + np.random.randn(per_arm)*noise
+        ]))
+    c = np.vstack(pts)
+    np.random.shuffle(c)
+    return c[:n].astype(np.float32)
+
+
+def make_rings(n, noise=0.03):
+    """Create concentric rings dataset."""
+    X, _ = make_circles(n, noise=noise, factor=0.5, random_state=42)
+    return (X * 2).astype(np.float32)
+
+
+def make_swissroll2d(n, noise=0.05):
+    """Create a 2D Swiss roll dataset."""
+    t = 1.5 * np.pi * (1 + 2 * np.random.rand(n))
+    return np.column_stack([
+        t*np.cos(t)/6,
+        t*np.sin(t)/6
+    ]).astype(np.float32) + np.random.randn(n, 2).astype(np.float32) * noise
+
+
+# ------------------------------------------------------------
+# Learnable GMM prior (uniform weights, full covariance)
+# ------------------------------------------------------------
+class GMMPrior(nn.Module):
+    def __init__(self, k=8, z_dim=2, init_data=None):
+        super().__init__()
+        self.k = k
+        self.z_dim = z_dim
+
+        # if init_data is not None:
+        #     # Initialize from data statistics
+        #     self._init_from_data(init_data)
+        # else:
+        # Default initialization
+        self.means = nn.Parameter(torch.randn(k, z_dim) * 0.0)
+        self.chol_factors = nn.Parameter(
+            torch.eye(z_dim).unsqueeze(0).repeat(k, 1, 1) * 1.0
+        )
+
+    def _init_from_data(self, data):
+        """
+        Initialize GMM parameters based on dataset statistics.
+
+        Args:
+            data: (N, z_dim) tensor of data points
+        """
+        device = data.device
+
+        # Compute data statistics
+        data_mean = data.mean(dim=0)
+        data_std = data.std(dim=0)
+        data_min = data.min(dim=0)[0]
+        data_max = data.max(dim=0)[0]
+
+        # Initialize means: sample random points from data + small perturbation
+        # This ensures components start near actual data
+        indices = torch.randperm(data.size(0))[:self.k]
+        init_means = data[indices].clone()
+
+        # Add small random perturbation to avoid exact duplicates
+        perturbation = torch.randn_like(init_means) * 0.1 * data_std
+        init_means = init_means + perturbation
+
+        self.means = nn.Parameter(init_means)
+
+        # Initialize covariance based on data spread
+        # Use a fraction of the data variance to start with compact clusters
+        init_scale = (data_std.mean() * 0.3).item()  # Start with 30% of data std
+
+        # Initialize Cholesky factors as scaled identity
+        init_chol = torch.eye(self.z_dim, device=device) * init_scale
+        self.chol_factors = nn.Parameter(
+            init_chol.unsqueeze(0).repeat(self.k, 1, 1)
+        )
+
+        print(f"Initialized GMM prior from data:")
+        print(f"  Data range: [{data_min.cpu().numpy()}, {data_max.cpu().numpy()}]")
+        print(f"  Data std: {data_std.cpu().numpy()}")
+        print(f"  Initial cluster scale: {init_scale:.4f}")
+        print(f"  Mean positions range: [{self.means.min().item():.2f}, {self.means.max().item():.2f}]")
+
+    def covariance(self):
+        """Return full covariance matrices for each component via Cholesky decomposition."""
+        # Covariance = L @ L^T where L is lower triangular
+        L = torch.tril(self.chol_factors)  # Ensure lower triangular
+        cov = torch.bmm(L, L.transpose(1, 2))
+        return cov
+
+    def sample(self, n):
+        # uniform mixture weights
+        comp = torch.randint(0, self.k, (n,), device=self.means.device)
+
+        # Standard normal samples
+        eps = torch.randn(n, self.z_dim, device=self.means.device)
+
+        # Transform using Cholesky factor: z = mu + L @ eps
+        L = torch.tril(self.chol_factors[comp])  # (n, z_dim, z_dim)
+        z = self.means[comp] + torch.bmm(L, eps.unsqueeze(-1)).squeeze(-1)
+        return z
+
+    def variance_penalty(self):
+        """Penalize the determinant (volume) of covariance matrices."""
+        # det(Cov) = det(L @ L^T) = det(L)^2 = (prod of diagonal of L)^2
+        L = torch.tril(self.chol_factors)
+        diag = torch.diagonal(L, dim1=1, dim2=2)  # (k, z_dim)
+        log_det = 2 * torch.log(torch.abs(diag) + 1e-8).sum(dim=1)  # (k,)
+        return log_det.mean()
+
+    def compactness_penalty(self):
+        """
+        Penalize large clusters by penalizing the trace of covariance matrices.
+        Trace = sum of eigenvalues = sum of variances along principal axes.
+        Smaller trace = more compact clusters.
+        """
+        covs = self.covariance()  # (k, z_dim, z_dim)
+        traces = torch.diagonal(covs, dim1=1, dim2=2).sum(dim=1)  # (k,)
+        return traces.mean()
+
+    def frobenius_penalty(self):
+        """
+        Penalize large clusters using Frobenius norm of covariance matrices.
+        ||Σ||_F^2 = trace(Σ^T Σ) = sum of all squared elements.
+        More aggressive than trace penalty.
+        """
+        covs = self.covariance()  # (k, z_dim, z_dim)
+        frob_norm_sq = (covs ** 2).sum(dim=(1, 2))  # (k,)
+        return frob_norm_sq.mean()
+
+    def max_eigenvalue_penalty(self):
+        """
+        Penalize the maximum eigenvalue (largest spread direction).
+        Controls the longest axis of the ellipsoid.
+        """
+        covs = self.covariance()  # (k, z_dim, z_dim)
+        eigvals = torch.linalg.eigvalsh(covs)  # (k, z_dim), sorted ascending
+        max_eigvals = eigvals[:, -1]  # (k,)
+        return max_eigvals.mean()
+
+    def distance_penalty(self):
+        """Penalize small pairwise distances between component means."""
+        diff = self.means[:, None, :] - self.means[None, :, :]
+        dist2 = (diff ** 2).sum(dim=-1)
+        # mask out diagonal (self-distances)
+        mask = ~torch.eye(self.k, dtype=torch.bool, device=self.means.device)
+        return (1.0 / (dist2[mask] + 1e-4)).sum()
+
+    @torch.no_grad()
+    def assign_to_components(self, data):
+        """
+        Assign each data point to the Gaussian component with highest likelihood.
+
+        Args:
+            data: (N, z_dim) tensor of data points
+
+        Returns:
+            assignments: (N,) tensor of component indices
+        """
+        # Compute log probability of each data point under each component
+        # log p(x|k) = -0.5 * (x-mu_k)^T Sigma_k^{-1} (x-mu_k) - 0.5 * log|Sigma_k| - d/2 * log(2*pi)
+
+        N = data.size(0)
+        log_probs = torch.zeros(N, self.k, device=data.device)
+
+        covs = self.covariance()  # (k, z_dim, z_dim)
+
+        for k in range(self.k):
+            diff = data - self.means[k]  # (N, z_dim)
+
+            # Compute inverse and determinant via Cholesky
+            cov_k = covs[k]
+            try:
+                L = torch.linalg.cholesky(cov_k + 1e-6 * torch.eye(self.z_dim, device=data.device))
+                log_det = 2 * torch.log(torch.diag(L)).sum()
+
+                # Solve L^T x = diff^T for Mahalanobis distance
+                v = torch.linalg.solve_triangular(L, diff.T, upper=False)
+                mahal_dist = (v ** 2).sum(dim=0)
+
+                log_probs[:, k] = -0.5 * (mahal_dist + log_det + self.z_dim * np.log(2 * np.pi))
+            except:
+                # Fallback to simple Euclidean distance if Cholesky fails
+                dist2 = (diff ** 2).sum(dim=1)
+                log_probs[:, k] = -dist2
+
+        # Assign to component with highest log probability
+        assignments = torch.argmax(log_probs, dim=1)
+        return assignments
+
+    def sample_from_components(self, component_indices):
+        """
+        Sample from specific Gaussian components.
+
+        Args:
+            component_indices: (N,) tensor of component indices
+
+        Returns:
+            z: (N, z_dim) samples from the specified components
+        """
+        n = component_indices.size(0)
+        eps = torch.randn(n, self.z_dim, device=self.means.device)
+
+        # Transform using Cholesky factor: z = mu + L @ eps
+        L = torch.tril(self.chol_factors[component_indices])  # (n, z_dim, z_dim)
+        z = self.means[component_indices] + torch.bmm(L, eps.unsqueeze(-1)).squeeze(-1)
+        return z
+
+
+# ------------------------------------------------------------
+# Generator network
+# ------------------------------------------------------------
+class Generator(nn.Module):
+    def __init__(self, z_dim=2, hidden=32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(z_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, z_dim),  # Output same dimension as input
+        )
+
+        self.skip_weight = nn.Parameter(torch.tensor(1.0))  # Learnable skip connection weight
+
+    def forward(self, z):
+        # Add skip connection to encourage identity mapping
+        return self.net(z) #+ z #* self.skip_weight
+
+
+
+# ------------------------------------------------------------
+# RBF kernel
+# ------------------------------------------------------------
+def rbf_kernel(x, y, sigma):
+    diff = x[:, None, :] - y[None, :, :]
+    dist2 = (diff ** 2).sum(dim=-1)
+    return torch.exp(-dist2 / (2 * sigma ** 2))
+
+
+# ------------------------------------------------------------
+# Drifting field (Algorithm 1)
+# ------------------------------------------------------------
+def drifting_field(x, y_pos, y_neg, sigma, remove_self_repulsion=True):
+    k_pos = rbf_kernel(x, y_pos, sigma)
+    k_neg = rbf_kernel(x, y_neg, sigma)
+
+    if remove_self_repulsion:
+        k_neg.fill_diagonal_(0.0)
+
+    w_pos = k_pos / (k_pos.sum(dim=1, keepdim=True) + 1e-8)
+    w_neg = k_neg / (k_neg.sum(dim=1, keepdim=True) + 1e-8)
+
+    drift_pos = (w_pos[:, :, None] * (y_pos[None] - x[:, None])).sum(dim=1)
+    drift_neg = (w_neg[:, :, None] * (y_neg[None] - x[:, None])).sum(dim=1)
+
+    return drift_pos - drift_neg
+
+
+# ------------------------------------------------------------
+# Visualization
+# ------------------------------------------------------------
+@torch.no_grad()
+def plot_samples(G, prior, real_data, step, n=3000, use_pca=False):
+    z = prior.sample(n)
+    x = G(z).cpu()
+
+    y = real_data[
+        torch.randint(0, real_data.size(0), (n,))
+    ].cpu()
+
+    means = prior.means.cpu().numpy()
+    covs = prior.covariance().cpu().numpy()
+
+    # If high-dimensional, use PCA to project to 2D for visualization
+    if use_pca and z.shape[1] > 2:
+        from sklearn.decomposition import PCA
+        pca = PCA(n_components=2)
+
+        # Fit PCA on combined data
+        combined = torch.cat([z.cpu(), x, y], dim=0).numpy()
+        pca.fit(combined)
+
+        # Project to 2D
+        z_2d = pca.transform(z.cpu().numpy())
+        x_2d = pca.transform(x.numpy())
+        y_2d = pca.transform(y.numpy())
+        means_2d = pca.transform(means)
+
+        # Note: Can't easily visualize full covariance in 2D after PCA
+        plot_ellipses = False
+    else:
+        z_2d = z.cpu().numpy()
+        x_2d = x.numpy()
+        y_2d = y.numpy()
+        means_2d = means
+        plot_ellipses = True
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+
+    # latent space
+    axes[0].scatter(z_2d[:, 0], z_2d[:, 1], s=3, alpha=0.3)
+    axes[0].scatter(means_2d[:, 0], means_2d[:, 1], s=80, c="red", marker="x")
+
+    if plot_ellipses and z.shape[1] == 2:
+        for k in range(prior.k):
+            # 1-std ellipse from eigendecomposition
+            eigvals, eigvecs = np.linalg.eigh(covs[k])
+            angle = np.degrees(np.arctan2(eigvecs[1, 0], eigvecs[0, 0]))
+            w, h = 2 * np.sqrt(eigvals)  # 1-std axes
+            axes[0].add_patch(
+                Ellipse(
+                    means[k], w, h, angle=angle,
+                    fill=False, color="red", alpha=0.5,
+                )
+            )
+
+    # Create title with dimensionality info
+    dim_info = f"{z.shape[1]}D"
+    if use_pca and z.shape[1] > 2:
+        title_suffix = f" - {dim_info} (PCA projection)"
+    else:
+        title_suffix = f" - {dim_info}"
+
+    axes[0].set_title(f"Latent prior (step {step}){title_suffix}")
+    axes[0].axis("equal")
+
+    # data space
+    axes[1].scatter(y_2d[:, 0], y_2d[:, 1], s=5, alpha=0.3, label="real")
+    axes[1].scatter(x_2d[:, 0], x_2d[:, 1], s=5, alpha=0.7, label="generated", zorder=5)
+    axes[1].legend()
+    axes[1].set_title(f"Generated samples (step {step}){title_suffix}")
+    axes[1].axis("equal")
+
+    fig.tight_layout()
+    fig.savefig(f"step_{step}.png", dpi=150)
+    plt.close(fig)
+
+
+# ------------------------------------------------------------
+# High-dimensional embedding
+# ------------------------------------------------------------
+def embed_to_high_dim(data_2d, target_dim=1024, seed=None):
+    """
+    Embed 2D data into high-dimensional space via random rotation.
+
+    Args:
+        data_2d: (N, 2) numpy array
+        target_dim: target dimensionality
+        seed: random seed for reproducibility
+
+    Returns:
+        embedded_data: (N, target_dim) numpy array
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    N = data_2d.shape[0]
+
+    # Pad with zeros: (N, 2) -> (N, target_dim)
+    data_padded = np.zeros((N, target_dim), dtype=np.float32)
+    data_padded[:, :2] = data_2d
+
+    # Generate random orthogonal matrix via QR decomposition
+    random_matrix = np.random.randn(target_dim, target_dim).astype(np.float32)
+    Q, _ = np.linalg.qr(random_matrix)  # Q is orthogonal
+
+    # Apply rotation
+    data_rotated = data_padded @ Q.T
+
+    print(f"Embedded 2D data into {target_dim}D space:")
+    print(f"  Original data shape: {data_2d.shape}")
+    print(f"  Embedded data shape: {data_rotated.shape}")
+    print(f"  Data norm (before): {np.linalg.norm(data_2d, axis=1).mean():.4f}")
+    print(f"  Data norm (after): {np.linalg.norm(data_rotated, axis=1).mean():.4f}")
+    print(f"  Non-zero entries: {(np.abs(data_rotated) > 1e-6).sum() / data_rotated.size * 100:.1f}%")
+
+    return data_rotated
+
+
+# ------------------------------------------------------------
+# Dataset selection
+# ------------------------------------------------------------
+def get_dataset(dataset_name="spiral", n_samples=10000, **kwargs):
+    """
+    Get a dataset by name.
+
+    Args:
+        dataset_name: one of ["spiral", "checkerboard", "pinwheel", "rings", "swissroll"]
+        n_samples: number of samples to generate
+        **kwargs: additional arguments for the dataset function
+
+    Returns:
+        numpy array of shape (n_samples, 2)
+    """
+    if dataset_name == "spiral":
+        n_arms = kwargs.get("n_arms", 2)
+        noise = kwargs.get("noise", 0.001)
+        return make_multi_spiral(n_samples // n_arms, n_arms=n_arms, noise=noise)
+    elif dataset_name == "checkerboard":
+        noise = kwargs.get("noise", 0.05)
+        grid = kwargs.get("grid", 4)
+        return make_checkerboard(n_samples, noise=noise, grid=grid)
+    elif dataset_name == "pinwheel":
+        n_arms = kwargs.get("n_arms", 5)
+        noise = kwargs.get("noise", 0.05)
+        return make_pinwheel(n_samples, n_arms=n_arms, noise=noise)
+    elif dataset_name == "rings":
+        noise = kwargs.get("noise", 0.03)
+        return make_rings(n_samples, noise=noise)
+    elif dataset_name == "swissroll":
+        noise = kwargs.get("noise", 0.05)
+        return make_swissroll2d(n_samples, noise=noise)
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+
+
+# ------------------------------------------------------------
+# Training
+# ------------------------------------------------------------
+def train(dataset_name="spiral", n_components=8, var_weight=0.0, dist_weight=0.0,
+          id_weight=1.0, compact_weight=0.0, embed_dim=None, embed_seed=42, **dataset_kwargs):
+    """
+    Train the generator using drifting field with learnable GMM prior.
+
+    Args:
+        dataset_name: name of dataset to use (spiral, checkerboard, pinwheel, rings, swissroll)
+        n_components: number of Gaussian components in the mixture
+        var_weight: weight for variance penalty (log-determinant)
+        dist_weight: weight for distance penalty (to prevent components from collapsing)
+        id_weight: weight for identity loss (to encourage G to be close to identity)
+        compact_weight: weight for compactness penalty (to keep clusters small/tight)
+        embed_dim: if specified, embed 2D data into this dimension via random rotation
+        embed_seed: random seed for the embedding rotation
+        **dataset_kwargs: additional arguments for dataset generation
+    """
+    # fixed empirical dataset (2D)
+    real_data_2d = get_dataset(dataset_name, n_samples=20000, **dataset_kwargs)
+
+    # Optionally embed into high-dimensional space
+    if embed_dim is not None and embed_dim > 2:
+        real_data_np = embed_to_high_dim(real_data_2d, target_dim=embed_dim, seed=embed_seed)
+        z_dim = embed_dim
+        use_pca = True
+    else:
+        real_data_np = real_data_2d
+        z_dim = 2
+        use_pca = False
+
+    real_data = torch.from_numpy(real_data_np).to(device)
+
+    G = Generator(z_dim=z_dim).to(device)
+    # Initialize GMM prior with data statistics for better coverage
+    prior = GMMPrior(k=n_components, z_dim=z_dim, init_data=real_data).to(device)
+    # prior = GMMPrior(k=1, z_dim=z_dim, init_data=real_data).to(device)  # For ablation comparison
+
+    opt = optim.Adam(
+        list(G.parameters()) + list(prior.parameters()),
+        lr=1e-3,
+    )
+
+    batch_size = 512
+    steps = 200000
+
+    # Sigma scheduling: reduce from 5.0 to 0.1 over first 1000 iterations
+    sigma_start = 3.0
+    sigma_end = 0.1
+    sigma_warmup_steps = 4000
+    print(f"\nSigma schedule: {sigma_start} -> {sigma_end} over {sigma_warmup_steps} steps")
+    print(f"Training on {z_dim}D data")
+
+
+
+    # phase 3: train the generator with drifting field
+    # Now sample z from components corresponding to y
+    for step in range(steps):
+        # Update sigma based on current step
+        if step < sigma_warmup_steps:
+            # Linear interpolation from sigma_start to sigma_end
+            sigma = sigma_start - (sigma_start - sigma_end) * (step / sigma_warmup_steps)
+        else:
+            sigma = sigma_end
+
+        # First sample real data
+        idx = torch.randint(0, real_data.size(0), (batch_size,))
+        y = real_data[idx]
+
+        # Sample z from the Gaussian components assigned to y
+        z = prior.sample(batch_size).detach()  # Sample from the entire prior for diversity
+
+        # generate samples
+        x = G(z)
+
+        # drifting field
+        v = drifting_field(
+            x=x,
+            y_pos=y,
+            y_neg=x.detach(),
+            sigma=sigma,
+        )
+
+        # stop-gradient target
+        x_drift = (x + v).detach()
+        id_loss = ((x - z) ** 2).sum(dim=1).mean()
+
+        # losses
+        drift_loss = ((x - x_drift) ** 2).sum(dim=1).mean() 
+
+        loss = drift_loss #+ id_loss  
+
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        if step % 500 == 0:
+            print(
+                f"step {step:5d} | "
+                f"drift {drift_loss.item():.6f} | "
+                f"id {id_loss.item():.6f} | "
+                f"sigma {sigma:.4f}"
+            )
+
+        if step % 1000 == 0:
+            plot_samples(G, prior, real_data, step, n=6000, use_pca=use_pca)
+
+
+    plot_samples(G, prior, real_data, "final", n=6000, use_pca=use_pca)
+
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    # Choose a dataset to train on
+    # Options: "spiral", "checkerboard", "pinwheel", "rings", "swissroll"
+
+    # ========== 2D EXPERIMENTS ==========
+
+    # Example 1: Two-armed spiral (2D)
+    # train(
+    #     dataset_name="spiral",
+    #     n_arms=2,
+    #     noise=0.001,
+    #     n_components=40,
+    #     dist_weight=0.0000001,
+    #     compact_weight=0.02
+    # )
+
+    # Example 2: Checkerboard (2D)
+    # train(
+    #     dataset_name="checkerboard",
+    #     grid=4,
+    #     noise=0.05,
+    #     n_components=40,
+    #     dist_weight=0.0000001,
+    #     compact_weight=0.05
+    # )
+
+    # Example 3: Pinwheel (2D)
+    # train(
+    #     dataset_name="pinwheel",
+    #     n_arms=5,
+    #     noise=0.05,
+    #     n_components=25,
+    #     dist_weight=0.0000001,
+    #     compact_weight=0.03
+    # )
+
+    # ========== HIGH-DIMENSIONAL EXPERIMENTS ==========
+
+    # Example 4: Spiral embedded in 64D
+    # train(
+    #     dataset_name="spiral",
+    #     n_arms=2,
+    #     noise=0.001,
+    #     n_components=40,
+    #     dist_weight=0.0000001,
+    #     compact_weight=0.02,
+    #     embed_dim=64,
+    #     embed_seed=42
+    # )
+
+    # Example 5: Pinwheel embedded in 512D
+    train(
+        dataset_name="pinwheel",
+        n_arms=5,
+        noise=0.04,
+        n_components=1,
+        dist_weight=0.0000001,
+        compact_weight=0.03,
+        embed_dim=1000,
+        embed_seed=42
+    )
+
+    # Example 6: Swiss roll embedded in 1024D
+    # train(
+    #     dataset_name="swissroll",
+    #     noise=0.05,
+    #     n_components=30,
+    #     dist_weight=0.0000001,
+    #     compact_weight=0.03,
+    #     embed_dim=1024,
+    #     embed_seed=42
+    # )

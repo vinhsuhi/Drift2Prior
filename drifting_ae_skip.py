@@ -836,7 +836,7 @@ def train(
 
         # drifting field: compute v per component with component-specific y_pos / y_neg
         v_list = []
-        sigma = 0.01
+        sigma = 0.5
         for k in range(n_components):
             # B samples for this component
             x_k = x[k * batch_size : (k + 1) * batch_size]
@@ -928,8 +928,15 @@ if __name__ == "__main__":
     # train(
     #     dataset_name="checkerboard",
     #     grid=4,
-    #     noise=0.05,
+    #     noise=0.001,
     #     n_components=40,
+    #     id_weight=0.0,
+    #     var_weight=0.0001,  # Weight for collapse prevention (log det regularization)
+    #     embed_dim=3,
+    #     embed_seed=42,
+    #     kernel_type="rbf",
+    #     train_conditional=True,
+    #     full_neg=False,
     # )
 
     # Example 3: Pinwheel (2D)
@@ -948,15 +955,20 @@ if __name__ == "__main__":
     #     n_arms=2,
     #     noise=0.001,
     #     n_components=40,
-    #     embed_dim=64,
-    #     embed_seed=42
+    #     id_weight=0.0,
+    #     var_weight=0.0001,  # Weight for collapse prevention (log det regularization)
+    #     embed_dim=3,
+    #     embed_seed=42,
+    #     kernel_type="rbf",
+    #     train_conditional=True,
+    #     full_neg=False,
     # )
 
     # Example 5: Pinwheel embedded in 512D
     train(
         dataset_name="pinwheel",
         n_arms=5,
-        noise=0.03,
+        noise=0.001,
         n_components=25,
         id_weight=0.0,
         var_weight=0.0001,  # Weight for collapse prevention (log det regularization)
