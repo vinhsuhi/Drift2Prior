@@ -43,7 +43,7 @@ CANONICAL = torch.tensor([[0.0, -1.0], [0.0, 1.0]])   # (2, 2)
 
 # Fixed node-type features: one-hot so EGNN can tell the two nodes apart.
 # These are rotation-invariant scalars — they never change.
-NODE_FEAT = torch.tensor([[1.0, 0.0], [0.0, 1.0]])    # (2, n_feat=2)
+NODE_FEAT = torch.tensor([[1.0], [1.0]])    # (2, n_feat=1)
 
 # Inter-point distance of the canonical configuration (used as regulariser).
 CANONICAL_DIST = (CANONICAL[0] - CANONICAL[1]).norm().item()   # = 2.0
@@ -231,42 +231,129 @@ def drifting_field(
     return drift_pos - drift_neg
 
 
-# ── SO(2) Procrustes alignment ────────────────────────────────────────────────
+# ── SO(2)-aware drifting field ────────────────────────────────────────────────
 
-def so2_align(src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+def _so2_rotations(src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
     """
-    Align src to tgt via the optimal SO(2) rotation (closed-form Procrustes).
+    Compute the all-pairs optimal SO(2) rotation matrices.
 
-    For each batch element b, finds
-        R_b = argmin_{R ∈ SO(2)} || src[b] @ R.T − tgt[b] ||_F
-    and returns src[b] @ R_b.T.
+    For each pair (i, j), finds R[i,j] = argmin ||src[i] @ R.T − tgt[j]||_F.
 
-    Derivation: expanding the Frobenius norm, maximising tr(R @ H) over SO(2)
-    where H = src.T @ tgt gives the closed-form angle
-        θ = atan2(H[0,1] − H[1,0],  H[0,0] + H[1,1])
+    Derivation: maximise tr(R @ H[i,j]) over SO(2), where
+        H[i,j] = src[i].T @ tgt[j]  (2×2 cross-covariance).
+    Closed form: θ[i,j] = atan2(H[0,1]−H[1,0],  H[0,0]+H[1,1]).
 
-    R is computed from src.detach() so that gradients flow only through the
-    linear application  src → src @ R.T,  not through R itself.
-
-    src, tgt : (B, N, 2) — zero-centred point clouds
-    Returns  : (B, N, 2) — src after the per-sample optimal rotation
+    src : (B, N, 2)
+    tgt : (B, N, 2)
+    Returns R : (B, B, 2, 2)  — R[i,j] aligns src[i] to tgt[j].
     """
-    # Cross-covariance per sample: H[b] = src[b].T @ tgt[b]  shape (B, 2, 2)
-    H = torch.bmm(src.detach().transpose(1, 2), tgt)
+    # H[i,j,a,b] = Σ_n  src[i,n,a] * tgt[j,n,b]
+    H = torch.einsum("ina,jnb->ijab", src, tgt)   # (B, B, 2, 2)
 
-    a = H[:, 0, 0] + H[:, 1, 1]               # (B,)
-    b = H[:, 0, 1] - H[:, 1, 0]               # (B,)
+    a = H[..., 0, 0] + H[..., 1, 1]               # (B, B)
+    b = H[..., 0, 1] - H[..., 1, 0]               # (B, B)
     norm = (a ** 2 + b ** 2).sqrt().clamp(min=1e-8)
-    cos_t, sin_t = a / norm, b / norm
+    cos_t, sin_t = a / norm, b / norm              # (B, B)
 
-    # Build per-sample SO(2) rotation matrices
+    # Build (B, B, 2, 2) rotation matrices
     R = torch.stack([
-        torch.stack([ cos_t, -sin_t], dim=1),  # row 0
-        torch.stack([ sin_t,  cos_t], dim=1),  # row 1
-    ], dim=1)                                   # (B, 2, 2)
+        torch.stack([ cos_t, -sin_t], dim=-1),     # row 0
+        torch.stack([ sin_t,  cos_t], dim=-1),     # row 1
+    ], dim=-2)                                      # (B, B, 2, 2)
+    return R
 
-    # Apply: src_aligned[b] = src[b] @ R[b].T  (row-vector convention)
-    return torch.bmm(src, R.mT)
+
+def so2_drifting_field(
+    x:     torch.Tensor,   # (B, N, 2) — generated configs  (with grad)
+    y_pos: torch.Tensor,   # (B, N, 2) — real configs
+    y_neg: torch.Tensor,   # (B, N, 2) — negative configs   (x.detach())
+    sigma: float,
+    remove_self_repulsion: bool = True,
+    align: bool = True,
+) -> torch.Tensor:
+    """
+    Drifting field, optionally with all-pairs SO(2) alignment.
+
+    align=False: plain Euclidean field on flattened (B, N*2) configurations,
+                 identical to the original drifting.py algorithm.
+    align=True:  all-pairs SO(2) alignment.
+
+    For every pair (x_i, y_j) the optimal rotation R_ij that maps x_i
+    closest to y_j is found in closed form.  The RBF kernel uses the
+    resulting Procrustes distance, and the drift direction is expressed
+    back in x_i's original frame so it can be added directly to x_i.
+
+    Positive drift contribution from y_j toward x_i  (in x_i's frame):
+        y_j @ R_ij  −  x_i
+    (rotating y_j back by R_ij undoes the alignment, bringing it into x_i's
+    coordinate system).
+
+    Returns v : (B, N, 2) — drift vectors in x's original frame.
+    """
+    B, N, _ = x.shape
+
+    if not align:
+        # Plain Euclidean field on flattened configurations — same as original.
+        x_flat    = x.reshape(B, -1)
+        yp_flat   = y_pos.reshape(B, -1)
+        yn_flat   = y_neg.reshape(B, -1)
+
+        diff_p = yp_flat[None] - x_flat[:, None]           # (B, B, N*2)
+        diff_n = yn_flat[None] - x_flat[:, None]
+
+        dist2_pos = (diff_p ** 2).sum(dim=-1)
+        dist2_neg = (diff_n ** 2).sum(dim=-1)
+
+        k_pos = torch.exp(-dist2_pos / (2 * sigma ** 2))
+        k_neg = torch.exp(-dist2_neg / (2 * sigma ** 2))
+        if remove_self_repulsion:
+            k_neg = k_neg.clone()
+            k_neg.fill_diagonal_(0.0)
+
+        w_pos = k_pos / (k_pos.sum(dim=1, keepdim=True) + 1e-8)
+        w_neg = k_neg / (k_neg.sum(dim=1, keepdim=True) + 1e-8)
+
+        v_flat = (w_pos[..., None] * diff_p).sum(dim=1) \
+               - (w_neg[..., None] * diff_n).sum(dim=1)    # (B, N*2)
+        
+        return v_flat.reshape(B, N, 2)
+
+    # ── all-pairs rotation matrices ──────────────────────────────────────────
+    # R_pos[i,j] aligns x[i] to y_pos[j]  (computed without gradient)
+    R_pos = _so2_rotations(x.detach(), y_pos)        # (B, B, 2, 2)
+    # R_neg[i,j] aligns x[i] to y_neg[j]
+    R_neg = _so2_rotations(x.detach(), y_neg)             # (B, B, 2, 2)
+
+    # ── Procrustes distances for the RBF kernel ───────────────────────────────
+    # x_aligned[i,j] = x[i] @ R_pos[i,j].T  →  (B, B, N, 2)
+    # [i,j,n,b] = Σ_a x[i,n,a] * R_pos[i,j,b,a]
+    x_aln  = torch.einsum("ina,ijba->ijnb", x.detach(), R_pos)
+    dist2_pos = ((x_aln - y_pos[None]) ** 2).sum(dim=(-2, -1))   # (B, B)
+
+    xn_aln = torch.einsum("ina,ijba->ijnb", y_neg, R_neg)
+    dist2_neg = ((xn_aln - y_neg[None]) ** 2).sum(dim=(-2, -1))  # (B, B)
+
+    # ── kernel weights ────────────────────────────────────────────────────────
+    k_pos = torch.exp(-dist2_pos / (2 * sigma ** 2))              # (B, B)
+    k_neg = torch.exp(-dist2_neg / (2 * sigma ** 2))              # (B, B)
+
+    if remove_self_repulsion:
+        k_neg = k_neg.clone()
+        k_neg.fill_diagonal_(0.0)
+
+    w_pos = k_pos / (k_pos.sum(dim=1, keepdim=True) + 1e-8)
+    w_neg = k_neg / (k_neg.sum(dim=1, keepdim=True) + 1e-8)
+
+    # ── drift directions in x_i's original frame ─────────────────────────────
+    # y_j rotated back to x_i's frame:  y_j @ R_pos[i,j]
+    # [i,j,n,b] = Σ_a y_pos[j,n,a] * R_pos[i,j,a,b]
+    y_in_xi  = torch.einsum("jna,ijab->ijnb", y_pos, R_pos)       # (B, B, N, 2)
+    yn_in_xi = torch.einsum("jna,ijab->ijnb", y_neg, R_neg)       # (B, B, N, 2)
+
+    drift_pos = (w_pos[:, :, None, None] * (y_in_xi  - x[:, None])).sum(dim=1)
+    drift_neg = (w_neg[:, :, None, None] * (yn_in_xi - x[:, None])).sum(dim=1)
+
+    return drift_pos - drift_neg   # (B, N, 2)
 
 
 # ── Visualisation ─────────────────────────────────────────────────────────────
@@ -285,9 +372,9 @@ def plot_samples(G: nn.Module, step, n: int = 1000):
 
     # Prior positions
     z_cpu = z.cpu()
-    for node, color in enumerate(["tab:blue", "tab:orange"]):
+    for node, marker in enumerate(["o", "s"]):
         axes[0].scatter(z_cpu[:, node, 0], z_cpu[:, node, 1],
-                        s=3, alpha=0.3, c=color, label=f"node {node}")
+                        s=3, alpha=0.3, c="tab:blue", marker=marker, label=f"node {node}")
     axes[0].set_title(f"Prior positions  (step {step})")
     axes[0].legend(fontsize=7)
     axes[0].axis("equal")
@@ -296,14 +383,16 @@ def plot_samples(G: nn.Module, step, n: int = 1000):
     for node_idx, marker in enumerate(["o", "s"]):
         # Real orbit samples
         axes[1].scatter(y[:, node_idx, 0], y[:, node_idx, 1],
-                        s=4, alpha=0.2, label=f"real node {node_idx}")
+                        s=4, alpha=0.25, c="#2196F3", marker=marker,
+                        label=f"real node {node_idx}" if node_idx == 0 else "_")
         # Generated positions
         axes[1].scatter(x[:, node_idx, 0], x[:, node_idx, 1],
-                        s=4, alpha=0.6, zorder=5, label=f"gen node {node_idx}")
+                        s=4, alpha=0.7, c="#F44336", marker=marker, zorder=5,
+                        label=f"gen node {node_idx}" if node_idx == 0 else "_")
         # Canonical point
         axes[1].scatter(canonical_cpu[node_idx, 0], canonical_cpu[node_idx, 1],
-                        s=120, zorder=10, marker=marker,
-                        label=f"canonical {node_idx}")
+                        s=120, zorder=10, c="#4CAF50", marker=marker,
+                        label=f"canonical {node_idx}" if node_idx == 0 else "_")
 
     # Unit circle for reference
     axes[1].plot(theta_ref.cos(), theta_ref.sin(), "k--", lw=0.8, alpha=0.4)
@@ -321,46 +410,42 @@ def plot_samples(G: nn.Module, step, n: int = 1000):
 # ── Training ──────────────────────────────────────────────────────────────────
 
 def train(
-    batch_size: int = 512,
+    batch_size: int = 20,
     steps:      int = 20000,
     sigma:      float = 0.3,
     n_hidden:   int = 64,
     n_layers:   int = 3,
-    lr:         float = 1e-3,
+    lr:         float = 1e-5,
     reg_weight: float = 0.1,
+    align:      bool = True,
 ):
-    G   = EGNNGenerator(n_feat=2, n_hidden=n_hidden, n_layers=n_layers).to(device)
+    G   = EGNNGenerator(n_feat=1, n_hidden=n_hidden, n_layers=n_layers).to(device)
     opt = optim.Adam(G.parameters(), lr=lr)
 
     for step in range(steps):
         # Real configurations: random SO(2) rotations of the canonical pair.
         y = sample_orbit(batch_size, device=device)          # (B, 2, 2)
+        y = CANONICAL.unsqueeze(0).expand(batch_size, -1, -1).to(device)   # (B, 2, 2)
         # Prior: two random 2D positions per sample.
         z = sample_prior(batch_size, device=device)          # (B, 2, 2)
 
         # Generated configurations.
         x = G(z)                                             # (B, 2, 2)
 
-        # Align x to y before computing the field: for each sample b, rotate
-        # x[b] into the same frame as y[b].  This makes Euclidean distances in
-        # the flattened 4D space meaningful (orientation-normalised).
-        x_aligned = so2_align(x, y)                         # (B, 2, 2)
-
-        # Flatten configurations to 4D vectors for the drifting field.
-        # Use reshape (not view) since einsum/bmm may yield non-contiguous tensors.
-        x_flat = x_aligned.reshape(batch_size, 4)
-        y_flat = y.reshape(batch_size, 4)
-
-        v = drifting_field(
-            x=x_flat,
-            y_pos=y_flat,
-            y_neg=x_flat.detach(),
+        # Drifting field with all-pairs SO(2) alignment.
+        # v[i] is expressed in x[i]'s original frame, so it can be added directly.
+        v = so2_drifting_field(
+            x=x,
+            y_pos=y,
+            y_neg=x.detach(),
             sigma=sigma,
-        )
-        x_drift = (x_flat + v).detach()                     # (B, 4)
+            align=align,
+        )                                                    # (B, 2, 2)
+
+        x_drift = (x + v).detach()                          # (B, 2, 2)
 
         # Drift loss: follow the field in configuration space.
-        drift_loss = ((x_flat - x_drift) ** 2).sum(dim=1).mean()
+        drift_loss = ((x - x_drift) ** 2).sum(dim=(-2, -1)).mean()
 
         # Geometry regularisation: keep the inter-point distance close to the
         # canonical distance (2.0).  This is rotation-invariant, so it does
