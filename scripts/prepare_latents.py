@@ -63,8 +63,9 @@ def main():
                     dist = vae.encode(xx).latent_dist
                     out[i : i + len(batch), j, :4] = dist.mean.float().cpu().numpy()
                     out[i : i + len(batch), j, 4:] = dist.std.float().cpu().numpy()
-        np.save(base + "_lat.npy", out)
-        np.save(base + "_lab.npy", labs)
+        np.save(base + "_lat.tmp.npy", out)
+        os.replace(base + "_lat.tmp.npy", base + "_lat.npy")
+        np.save(base + "_lab.npy", labs)  # written last = completion marker
         print(f"done {f} N={N}", flush=True)
 
 

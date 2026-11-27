@@ -36,7 +36,7 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--prior", required=True)
     ap.add_argument("--model", default=None)
-    ap.add_argument("--n", type=int, default=10000)
+    ap.add_argument("--num", type=int, default=10000)
     ap.add_argument("--steps", default="1,2")
     ap.add_argument("--bs", type=int, default=125)
     ap.add_argument("--out", default=None)
@@ -52,15 +52,15 @@ def main():
 
     d = torch.load(a.ckpt, map_location="cpu")
     mname = a.model or d["args"]["model"]
-    model = build(mname).to(dev).eval()
+    model = build(mname, tscale=d["args"].get("tscale", 1000.0)).to(dev).eval()
     model.load_state_dict(d["ema"])
     prior = load_prior(a.prior, dev, state=d.get("prior"))
     vae = AutoencoderKL.from_pretrained(os.environ.get("D2P_VAE", "/data/horse/ws/vito813i-d2p/cache/sd-vae-ft-ema")).to(dev).eval()
     inc = FeatureExtractorInceptionV3("inception-v3-compat", ["2048"]).to(dev).eval()
     ref = np.load(REF)
     mu_r, s_r = ref["mu"], ref["sigma"]
-    res = dict(ckpt=a.ckpt, prior=a.prior, n=a.n, step=d.get("step"))
-    labels_all = torch.arange(a.n) % 1000
+    res = dict(ckpt=a.ckpt, prior=a.prior, n=a.num, step=d.get("step"))
+    labels_all = torch.arange(a.num) % 1000
     mine = labels_all[rank::world]
     for st in [int(s) for s in a.steps.split(",")]:
         g = torch.Generator(device=dev).manual_seed(1234 + rank)

@@ -15,15 +15,16 @@ def modulate(x, shift, scale):
 
 
 class TimestepEmbedder(nn.Module):
-    def __init__(self, hidden, freq=256):
+    def __init__(self, hidden, freq=256, tscale=1000.0):
         super().__init__()
         self.freq = freq
+        self.tscale = tscale
         self.mlp = nn.Sequential(nn.Linear(freq, hidden), nn.SiLU(), nn.Linear(hidden, hidden))
 
     def forward(self, t):
         half = self.freq // 2
         f = torch.exp(-math.log(10000) * torch.arange(half, device=t.device, dtype=torch.float32) / half)
-        a = (t.float() * 1000.0)[:, None] * f[None]
+        a = (t.float() * self.tscale)[:, None] * f[None]
         emb = torch.cat([torch.cos(a), torch.sin(a)], dim=-1)
         return self.mlp(emb.to(self.mlp[0].weight.dtype))
 
@@ -99,15 +100,15 @@ def sincos_pos_embed(dim, grid):
 
 
 class DiT(nn.Module):
-    def __init__(self, input_size=32, patch=2, in_ch=4, dim=768, depth=12, heads=12, num_classes=1000):
+    def __init__(self, input_size=32, patch=2, in_ch=4, dim=768, depth=12, heads=12, num_classes=1000, tscale=1000.0):
         super().__init__()
         self.in_ch, self.patch, self.input_size = in_ch, patch, input_size
         self.num_classes = num_classes
         self.x_embed = nn.Conv2d(in_ch, dim, patch, patch)
         n = (input_size // patch) ** 2
         self.register_buffer("pos", sincos_pos_embed(dim, input_size // patch).unsqueeze(0), persistent=False)
-        self.t_emb = TimestepEmbedder(dim)
-        self.h_emb = TimestepEmbedder(dim)  # interval length t - r
+        self.t_emb = TimestepEmbedder(dim, tscale=tscale)
+        self.h_emb = TimestepEmbedder(dim, tscale=tscale)  # interval length t - r
         self.y_emb = LabelEmbedder(num_classes, dim)
         self.blocks = nn.ModuleList([Block(dim, heads) for _ in range(depth)])
         self.final = FinalLayer(dim, patch, in_ch)

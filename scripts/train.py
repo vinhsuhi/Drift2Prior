@@ -57,6 +57,7 @@ def main():
     ap.add_argument("--data", default="/data/horse/ws/vito813i-d2p/data/latents")
     ap.add_argument("--prior", required=True)
     ap.add_argument("--model", default="B/2")
+    ap.add_argument("--tscale", type=float, default=1.0)
     ap.add_argument("--bs", type=int, default=64, help="per GPU")
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--steps", type=int, default=400000)
@@ -98,7 +99,7 @@ def main():
     prior = load_prior(a.prior, dev)
     if a.joint and not prior.is_learnable:
         prior.make_learnable(fix_volume=a.fix_volume)
-    model = build(a.model).to(dev)
+    model = build(a.model, tscale=a.tscale).to(dev)
     ema = copy.deepcopy(model).eval().requires_grad_(False)
     groups = [dict(params=list(model.parameters()), lr=a.lr)]
     if prior.is_learnable:
