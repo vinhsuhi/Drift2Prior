@@ -40,7 +40,7 @@ def main():
     a = ap.parse_args()
     dev = "cuda"
     d = torch.load(a.ckpt, map_location="cpu")
-    model = build(d["args"]["model"], tscale=d["args"].get("tscale", 1000.0)).to(dev).eval()
+    model = build(d["args"]["model"], tscale=d["args"].get("tscale", 1.0)).to(dev).eval()
     model.load_state_dict(d["ema"])
     prior = load_prior(a.prior, dev, state=d.get("prior"))
     data = Latents(a.data)

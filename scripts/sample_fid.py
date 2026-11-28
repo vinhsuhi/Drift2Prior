@@ -52,7 +52,7 @@ def main():
 
     d = torch.load(a.ckpt, map_location="cpu")
     mname = a.model or d["args"]["model"]
-    model = build(mname, tscale=d["args"].get("tscale", 1000.0)).to(dev).eval()
+    model = build(mname, tscale=d["args"].get("tscale", 1.0)).to(dev).eval()
     model.load_state_dict(d["ema"])
     prior = load_prior(a.prior, dev, state=d.get("prior"))
     vae = AutoencoderKL.from_pretrained(os.environ.get("D2P_VAE", "/data/horse/ws/vito813i-d2p/cache/sd-vae-ft-ema")).to(dev).eval()
