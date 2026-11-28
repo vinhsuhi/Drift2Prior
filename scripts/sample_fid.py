@@ -41,6 +41,7 @@ def main():
     ap.add_argument("--bs", type=int, default=125)
     ap.add_argument("--out", default=None)
     ap.add_argument("--save_grid", action="store_true")
+    ap.add_argument("--temp", type=float, default=1.0, help="sampling-time scale on prior std (fixed priors only)")
     a = ap.parse_args()
     dist.init_process_group("nccl")
     rank, world = dist.get_rank(), dist.get_world_size()
@@ -55,6 +56,9 @@ def main():
     model = build(mname, tscale=d["args"].get("tscale", 1.0)).to(dev).eval()
     model.load_state_dict(d["ema"])
     prior = load_prior(a.prior, dev, state=d.get("prior"))
+    if a.temp != 1.0:
+        assert not prior.is_learnable
+        prior.std.mul_(a.temp)
     vae = AutoencoderKL.from_pretrained(os.environ.get("D2P_VAE", "/data/horse/ws/vito813i-d2p/cache/sd-vae-ft-ema")).to(dev).eval()
     inc = FeatureExtractorInceptionV3("inception-v3-compat", ["2048"]).to(dev).eval()
     ref = np.load(REF)

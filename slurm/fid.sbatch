@@ -5,4 +5,4 @@
 # usage: CKPT=... PRIOR=... OUT=....json N=10000 STEPS=1,2 sbatch slurm/fid.sbatch
 source /home/h9/vito813i/Drift2Prior/slurm/common.sh
 NG=$(nvidia-smi -L | wc -l)
-$D2P/env/bin/torchrun --standalone --nproc_per_node $NG scripts/sample_fid.py --ckpt $CKPT --prior $PRIOR --num ${N:-10000} --steps ${STEPS:-1,2} --out $OUT --save_grid
+$D2P/env/bin/torchrun --standalone --nproc_per_node $NG scripts/sample_fid.py --ckpt $CKPT --prior $PRIOR --num ${N:-10000} --steps ${STEPS:-1,2} --out $OUT --save_grid --temp ${TEMP:-1.0}
